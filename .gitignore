@@ -1,0 +1,27 @@
+# Added by code-review-graph
+.code-review-graph/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+
+# Reports
+reports/
+.superpowers/
+
+# AI tooling (local-only)
+.claude/
+.mcp.json
+CLAUDE.md
+code-review-graph.md
+docs/
+.serena/
+.DS_Store
+.pytest_cache/
