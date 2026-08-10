@@ -40,3 +40,54 @@ pytest
 ## 技术栈
 
 LangGraph · LangChain · DeepSeek · Textual · AkShare · Rich
+
+## Skills
+
+FinAgent 支持用户自定义 skill(类似 Claude Code 的 skill 机制)。Skill 是
+一组按场景激活的指令,放在 `skill.md` 文件中。
+
+### Skill 目录
+
+FinAgent 扫描两个目录,同名时**项目目录覆盖用户目录**:
+
+- 用户全局: `~/.finagent/skills/<name>/skill.md`
+- 项目本地: `./.finagent/skills/<name>/skill.md`
+
+### Skill 文件格式
+
+```markdown
+---
+name: my-skill
+description: 一句话描述,出现在每轮 system-reminder 的 catalog 中
+---
+
+# My Skill
+
+激活此 skill 时,你应:
+1. ...
+2. 用 read_file 加载 assets/template.md
+```
+
+`frontmatter` 仅需 `name`(合法字符 `[A-Za-z0-9_-]+`)和 `description`。
+
+保留名(不可用作 skill name): `report` / `clear` / `help` / `quit` / `reload_skills`。
+
+### 激活 skill
+
+- 用户输入 `/<skill-name>`(如 `/my-skill`)
+- 或让 agent 调用 `load_skill(name="my-skill")` 工具
+- 两种方式产出等价的对话历史
+
+### 渐进式披露
+
+skill.md 仅包含指令;大型资源(模板、脚本)放在 skill 目录的 `assets/` /
+`scripts/` 子目录下,agent 按需通过 `read_file(path="skills/my-skill/assets/x.md")`
+加载。
+
+### 热更新
+
+新增/修改/删除 skill 文件后,在 TUI 中输入 `/reload_skills` 重新扫描目录。
+
+### 报告路径
+
+生成的财报点评报告写入 `./.finagent/reports/`(项目本地)。

@@ -11,33 +11,39 @@ from textual.message import Message
 from textual.widgets import Static, TextArea
 from textual.worker import get_current_worker
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from finagent.agent import create_agent, reset_checkpoint
-from finagent.config import load_env
+from finagent.config import load_env, MODEL_NAME, CONTEXT_WINDOW_TOKENS
 from finagent.report import generate_report, set_current_report
+from finagent.skills import read_skill_md, render_catalog, scan_skills
 
 HELP_TEXT = """\
 可用命令:
-  /report   生成财报点评报告（基于当前对话历史）
-  /clear    清空对话记忆（换公司分析时用）
-  /help     显示此帮助
-  /quit     退出
+  /report         生成财报点评报告（基于当前对话历史）
+  /clear          清空对话记忆（换公司分析时用）
+  /reload_skills  重新扫描 skill 目录，热更新可用列表
+  /<skill-name>   激活指定 skill（列表见每轮 system-reminder）
+  /help           显示此帮助
+  /quit           退出
 """
 
-_COMMANDS = {"/quit", "/help", "/clear", "/report"}
+_COMMANDS = {"/quit", "/help", "/clear", "/report", "/reload_skills"}
 
 
-def parse_command(text: str) -> tuple[str, str]:
+def parse_command(text: str, skill_names: frozenset[str] = frozenset()) -> tuple[str, str]:
     """Parse user input into (command_name, payload).
 
     Returns ("message", text) for non-command input.
     For slash commands, returns (command_name_without_slash, "").
+    For /<skill-name> matching an active skill, returns ("skill", skill_name).
     """
     stripped = text.strip()
     lower = stripped.lower()
     if lower in _COMMANDS:
         return lower[1:], ""
+    if stripped.startswith("/") and stripped[1:] in skill_names:
+        return "skill", stripped[1:]
     return "message", stripped
 
 
@@ -81,6 +87,11 @@ class FinAgentApp(App):
         self.agent = create_agent()
         self._queue: list[tuple[str, Static]] = []
         self._streaming_worker = None
+        self._cumulative_input_tokens: int = 0
+        # Skill catalog (refreshed by /reload_skills and at startup)
+        metas = scan_skills()
+        self._skill_catalog_names: frozenset[str] = frozenset(metas.keys())
+        self._skill_catalog: str = render_catalog(metas)
 
     def compose(self) -> ComposeResult:
         yield Static("FinAgent — A股财报点评助手", id="header")
@@ -93,12 +104,13 @@ class FinAgentApp(App):
         self.query_one("#chat-view").can_focus = False
         self._add_message("输入股票代码 + 报告期开始分析。输入 /help 查看命令。")
         self.query_one("#input").focus()
+        self._refresh_status_bar()
 
     def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
         text = event.value.strip()
         if not text:
             return
-        cmd, payload = parse_command(text)
+        cmd, payload = parse_command(text, skill_names=self._skill_catalog_names)
         if cmd == "quit":
             self.exit()
         elif cmd == "help":
@@ -107,6 +119,10 @@ class FinAgentApp(App):
             self._do_clear()
         elif cmd == "report":
             self._do_report()
+        elif cmd == "reload_skills":
+            self._do_reload_skills()
+        elif cmd == "skill":
+            self._activate_skill(payload)
         else:
             self._submit_message(payload)
 
@@ -121,6 +137,15 @@ class FinAgentApp(App):
     def _set_status(self, text: str) -> None:
         self.query_one("#status").update(text)
 
+    def _refresh_status_bar(self) -> None:
+        """Show model name + cumulative token usage in the status bar."""
+        pct = self._cumulative_input_tokens * 100 / CONTEXT_WINDOW_TOKENS
+        k_tokens = self._cumulative_input_tokens // 1000
+        window_m = CONTEXT_WINDOW_TOKENS // 1_000_000
+        self.query_one("#status").update(
+            f"{MODEL_NAME} | {k_tokens}K/{window_m}M ({pct:.1f}%)"
+        )
+
     def _submit_message(self, text: str) -> None:
         """Send a message to the agent, or enqueue if agent is busy."""
         if self._streaming_worker is not None and self._streaming_worker.is_running:
@@ -129,6 +154,20 @@ class FinAgentApp(App):
         else:
             self._add_message(f"> {text}", classes="message-user")
             self._streaming_worker = self._start_stream(text)
+
+    def _build_user_message(self, user_input: str) -> str:
+        """Wrap user input with skill catalog as system-reminder suffix.
+
+        System prompt is intentionally left untouched to preserve DeepSeek
+        prompt-cache hits; catalog rides in the user message.
+        """
+        return (
+            f"{user_input}\n\n"
+            f"<system-reminder>\n"
+            f"可用 skills(用 load_skill 工具加载,或用户输入 /<name>):\n"
+            f"{self._skill_catalog}\n"
+            f"</system-reminder>"
+        )
 
     @work
     async def _start_stream(self, user_input: str) -> None:
@@ -146,9 +185,10 @@ class FinAgentApp(App):
         tool_names: dict[str, str] = {}
         last_update = 0.0
         need_new_reply = False
+        last_ai_msg = None
         try:
             async for mode, data in self.agent.astream(
-                {"messages": [{"role": "user", "content": user_input}]},
+                {"messages": [{"role": "user", "content": self._build_user_message(user_input)}]},
                 config={"configurable": {"thread_id": self.thread_id}},
                 stream_mode=["messages", "updates"],
             ):
@@ -192,10 +232,17 @@ class FinAgentApp(App):
                                 if w is not None:
                                     w.update(f"🔧 {name} ✓")
                                 need_new_reply = True
+                            if type(msg).__name__ == "AIMessage" and getattr(msg, "usage_metadata", None):
+                                last_ai_msg = msg
             if buffer and reply_widget is not None:
                 reply_widget.update(buffer)
             elif reply_widget is not None:
                 reply_widget.remove()
+            if last_ai_msg is not None:
+                usage = getattr(last_ai_msg, "usage_metadata", None) or {}
+                input_tokens = usage.get("input_tokens")
+                if isinstance(input_tokens, int):
+                    self._cumulative_input_tokens += input_tokens
         except Exception as e:
             self._add_message(f"出错: {e}", classes="message-error")
         finally:
@@ -203,7 +250,7 @@ class FinAgentApp(App):
             if self._streaming_worker is not current:
                 # cancelled/superseded: don't clobber a newer worker's state
                 return
-            self._set_status("就绪")
+            self._refresh_status_bar()
             self._streaming_worker = None
             # remove queued message widgets and flush merged queue
             if self._queue:
@@ -230,12 +277,56 @@ class FinAgentApp(App):
         self._streaming_worker = None
         reset_checkpoint()
         self.thread_id = str(uuid.uuid4())
+        self._cumulative_input_tokens = 0
         self.agent = create_agent()
         # /clear 语义为切到新公司分析，丢弃上一 session 的报告路径
         set_current_report(None)
         self._queue.clear()
         self.query_one("#chat-view").remove_children()
-        self._set_status("就绪")
+        self._refresh_status_bar()
+
+    def _do_reload_skills(self) -> None:
+        """Rescan skill directories, refresh in-memory catalog."""
+        metas = scan_skills()
+        self._skill_catalog_names = frozenset(metas.keys())
+        self._skill_catalog = render_catalog(metas)
+        self._add_message(f"已加载 {len(metas)} 个 skill")
+
+    def _activate_skill(self, name: str) -> None:
+        """Activate a skill by slash command: inject HumanMessage + ToolMessage.
+
+        Produces history equivalent to the agent calling load_skill itself.
+        """
+        try:
+            skill_md = read_skill_md(name)
+        except FileNotFoundError:
+            # Catalog matched but file vanished — treat as ordinary message
+            self._submit_message(f"/{name}")
+            return
+        tool_call_id = f"skill-{uuid.uuid4()}"
+        self.agent.update_state(
+            config={"configurable": {"thread_id": self.thread_id}},
+            values={"messages": [
+                HumanMessage(content=f"/{name}"),
+                AIMessage(
+                    content="",
+                    tool_calls=[{
+                        "name": "load_skill",
+                        "args": {"name": name},
+                        "id": tool_call_id,
+                        "type": "tool_call",
+                    }],
+                ),
+                ToolMessage(content=skill_md, tool_call_id=tool_call_id, name="load_skill"),
+            ]},
+        )
+        # Title from first markdown heading, if present
+        title = name
+        for line in skill_md.splitlines():
+            if line.startswith("#"):
+                title = line.lstrip("#").strip()
+                break
+        self._add_message(f"✓ skill 已加载: {name} — {title}", classes="message-tool")
 
     @work(thread=True)
     def _do_report(self) -> None:

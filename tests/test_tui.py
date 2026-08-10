@@ -397,3 +397,316 @@ async def test_interrupt_cancels_worker():
             chat = app.query_one("#chat-view")
             messages = [str(c.content) for c in chat.children if isinstance(c, Static)]
             assert any("已中断" in m for m in messages)
+
+
+def test_parse_command_skill_match():
+    cmd, payload = parse_command("/news-radar", skill_names=frozenset({"news-radar"}))
+    assert cmd == "skill"
+    assert payload == "news-radar"
+
+
+def test_parse_command_skill_no_match_falls_back_to_message():
+    """Unknown /xxx with no matching skill is treated as plain message."""
+    cmd, payload = parse_command("/not-a-skill", skill_names=frozenset({"news-radar"}))
+    assert cmd == "message"
+    assert payload == "/not-a-skill"
+
+
+def test_parse_command_skill_default_empty_names():
+    """Without skill_names, /xxx falls back to message (backward compat)."""
+    cmd, payload = parse_command("/anything")
+    assert cmd == "message"
+
+
+def test_parse_command_reload_skills_recognized():
+    cmd, _ = parse_command("/reload_skills")
+    assert cmd == "reload_skills"
+
+
+@pytest.mark.asyncio
+async def test_reload_skills_refreshes_catalog(app, tmp_path, monkeypatch):
+    """Skill added to disk shows up after /reload_skills."""
+    from pathlib import Path
+    from finagent import skills
+
+    fake_cwd = tmp_path / "cwd"
+    fake_cwd.mkdir()
+    (fake_cwd / ".finagent" / "skills").mkdir(parents=True)
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+
+    monkeypatch.setattr(Path, "cwd", lambda: fake_cwd)
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+    async with app.run_test() as pilot:
+        # Initially empty
+        assert "demo-skill" not in app._skill_catalog_names
+
+        # Add skill on disk
+        d = fake_cwd / ".finagent" / "skills" / "demo-skill"
+        d.mkdir()
+        (d / "skill.md").write_text(
+            "---\nname: demo-skill\ndescription: for test\n---\nbody", encoding="utf-8"
+        )
+
+        app.query_one("#input", ChatInput).text = "/reload_skills"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert "demo-skill" in app._skill_catalog_names
+        chat = app.query_one("#chat-view")
+        msgs = [str(c.content) for c in chat.children if isinstance(c, Static)]
+        assert any("已加载" in m for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_user_message_includes_skill_catalog(app):
+    """Each turn's user message must carry the skill catalog suffix."""
+    app._skill_catalog = "- demo: 测试 skill"
+    captured = []
+
+    async def fake_astream(*args, **kwargs):
+        captured.append(args[0])  # the messages dict
+        return
+        yield  # make it an async generator
+
+    app.agent.astream = fake_astream
+    async with app.run_test() as pilot:
+        app.query_one("#input", ChatInput).text = "hello"
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert captured, "astream was not invoked"
+    user_msg = captured[0]["messages"][0]
+    content = user_msg["content"] if isinstance(user_msg, dict) else getattr(user_msg, "content", "")
+    assert "hello" in content
+    assert "<system-reminder>" in content
+    assert "demo: 测试 skill" in content
+
+
+@pytest.mark.asyncio
+async def test_activate_skill_injects_messages(app, tmp_path, monkeypatch):
+    """/<skill-name> must inject HumanMessage + ToolMessage into history."""
+    from pathlib import Path
+    from finagent import skills
+
+    fake_cwd = tmp_path / "cwd"
+    fake_cwd.mkdir()
+    (fake_cwd / ".finagent" / "skills" / "demo-skill").mkdir(parents=True)
+    (fake_cwd / ".finagent" / "skills" / "demo-skill" / "skill.md").write_text(
+        "---\nname: demo-skill\ndescription: d\n---\n# Demo\nbody content", encoding="utf-8"
+    )
+    monkeypatch.setattr(Path, "cwd", lambda: fake_cwd)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+
+    # Refresh app's catalog so /demo-skill matches
+    metas = skills.scan_skills()
+    app._skill_catalog_names = frozenset(metas.keys())
+
+    captured = {}
+    def fake_update_state(config=None, values=None):
+        captured["config"] = config
+        captured["values"] = values
+    app.agent.update_state = fake_update_state
+
+    async with app.run_test() as pilot:
+        app.query_one("#input", ChatInput).text = "/demo-skill"
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert "values" in captured
+    msgs = captured["values"].get("messages", [])
+    # Expect at least HumanMessage + ToolMessage
+    types = [type(m).__name__ for m in msgs]
+    assert "HumanMessage" in types
+    assert "ToolMessage" in types
+    # ToolMessage content should contain skill body
+    tool_msgs = [m for m in msgs if type(m).__name__ == "ToolMessage"]
+    assert any("body content" in str(getattr(m, "content", "")) for m in tool_msgs)
+
+
+@pytest.mark.asyncio
+async def test_activate_skill_injects_deepseek_valid_sequence(app, tmp_path, monkeypatch):
+    """_activate_skill must inject [HumanMessage, AIMessage, ToolMessage] so
+    DeepSeek sees a valid tool-call flow (ToolMessage preceded by AIMessage
+    with matching tool_calls). Current code omits the AIMessage → 400 error.
+    """
+    from pathlib import Path
+    from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+    from finagent import skills
+
+    fake_cwd = tmp_path / "cwd"
+    fake_cwd.mkdir()
+    (fake_cwd / ".finagent" / "skills" / "demo-skill").mkdir(parents=True)
+    (fake_cwd / ".finagent" / "skills" / "demo-skill" / "skill.md").write_text(
+        "---\nname: demo-skill\ndescription: d\n---\n# Demo\nbody content", encoding="utf-8"
+    )
+    monkeypatch.setattr(Path, "cwd", lambda: fake_cwd)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+
+    metas = skills.scan_skills()
+    app._skill_catalog_names = frozenset(metas.keys())
+
+    captured = {}
+    def fake_update_state(config=None, values=None):
+        captured["values"] = values
+    app.agent.update_state = fake_update_state
+
+    async with app.run_test() as pilot:
+        app.query_one("#input", ChatInput).text = "/demo-skill"
+        await pilot.press("enter")
+        await pilot.pause()
+
+    msgs = captured["values"]["messages"]
+    # Exact 3-message sequence
+    assert len(msgs) == 3, f"expected 3 messages, got {len(msgs)}"
+    assert isinstance(msgs[0], HumanMessage)
+    assert isinstance(msgs[1], AIMessage)
+    assert isinstance(msgs[2], ToolMessage)
+    # HumanMessage content
+    assert msgs[0].content == "/demo-skill"
+    # AIMessage: empty content, single load_skill tool_call with matching id
+    assert msgs[1].content == ""
+    assert len(msgs[1].tool_calls) == 1
+    tc = msgs[1].tool_calls[0]
+    assert tc["name"] == "load_skill"
+    assert tc["args"] == {"name": "demo-skill"}
+    assert tc["type"] == "tool_call"
+    tool_call_id = tc["id"]
+    # ToolMessage: matching id, name, skill.md body
+    assert msgs[2].tool_call_id == tool_call_id
+    assert msgs[2].name == "load_skill"
+    assert "body content" in msgs[2].content
+
+
+@pytest.mark.asyncio
+async def test_activate_skill_unknown_falls_through(app):
+    """If /<name> doesn't match a known skill, it's sent as plain text."""
+    captured = []
+    async def fake_astream(*args, **kwargs):
+        captured.append(args[0])
+        return
+        yield
+
+    app.agent.astream = fake_astream
+    async with app.run_test() as pilot:
+        app.query_one("#input", ChatInput).text = "/not-a-skill"
+        await pilot.press("enter")
+        await pilot.pause()
+
+    # Falls through to message: astream called with the raw text
+    assert captured
+    user_msg = captured[0]["messages"][0]
+    content = user_msg["content"] if isinstance(user_msg, dict) else getattr(user_msg, "content", "")
+    assert "/not-a-skill" in content
+
+
+@pytest.mark.asyncio
+async def test_token_counter_accumulates(app):
+    """Two turns with usage_metadata should accumulate input_tokens."""
+    from finagent.config import CONTEXT_WINDOW_TOKENS
+
+    # Build two fake responses with usage_metadata
+    class FakeChunk:
+        def __init__(self, content="", tool_call_chunks=None, usage_metadata=None):
+            self.content = content
+            self.tool_call_chunks = tool_call_chunks
+            self.usage_metadata = usage_metadata
+
+    # Simulate stream: yields messages chunks, then final AIMessage in updates
+    async def fake_astream(*args, **kwargs):
+        # First chunk: text + usage at end of messages mode
+        yield ("messages", (FakeChunk(content="hello", usage_metadata={"input_tokens": 500, "output_tokens": 100, "total_tokens": 600}), {}))
+        # Updates with final AIMessage carrying usage_metadata
+        from langchain_core.messages import AIMessage
+        ai = AIMessage(content="hello", usage_metadata={"input_tokens": 500, "output_tokens": 100, "total_tokens": 600})
+        yield ("updates", {"agent": {"messages": [ai]}})
+
+    app.agent.astream = fake_astream
+    async with app.run_test() as pilot:
+        app.query_one("#input", ChatInput).text = "first"
+        await pilot.press("enter")
+        await pilot.pause()
+        first_total = app._cumulative_input_tokens
+        assert first_total == 500
+
+        app.query_one("#input", ChatInput).text = "second"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app._cumulative_input_tokens == 1000
+
+
+@pytest.mark.asyncio
+async def test_token_counter_missing_usage_does_not_crash(app):
+    """If usage_metadata is None, counter stays unchanged and no exception."""
+    async def fake_astream(*args, **kwargs):
+        from langchain_core.messages import AIMessage
+        ai = AIMessage(content="ok")  # no usage_metadata
+        yield ("updates", {"agent": {"messages": [ai]}})
+
+    app.agent.astream = fake_astream
+    async with app.run_test() as pilot:
+        before = app._cumulative_input_tokens
+        app.query_one("#input", ChatInput).text = "x"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app._cumulative_input_tokens == before
+
+
+@pytest.mark.asyncio
+async def test_clear_resets_token_counter(app):
+    app._cumulative_input_tokens = 9999
+    async with app.run_test() as pilot:
+        app.query_one("#input", ChatInput).text = "/clear"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app._cumulative_input_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_status_bar_shows_model_and_tokens_initially(app):
+    """on_mount must initialize status bar to model+token format, not 就绪."""
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        status = app.query_one("#status")
+        text = str(status.content)
+        assert "deepseek-chat" in text
+        assert "0K/1M" in text
+        assert "(0.0%)" in text
+
+
+@pytest.mark.asyncio
+async def test_status_bar_shows_token_count_after_response(app):
+    """After a successful stream with usage_metadata, status bar reflects accumulated tokens."""
+    from langchain_core.messages import AIMessage
+
+    async def fake_astream(*args, **kwargs):
+        yield ("messages", (type("C", (), {"content": "hi", "tool_call_chunks": None, "usage_metadata": None}), {}))
+        ai = AIMessage(content="hi", usage_metadata={"input_tokens": 1500, "output_tokens": 50, "total_tokens": 1550})
+        yield ("updates", {"agent": {"messages": [ai]}})
+
+    app.agent.astream = fake_astream
+    async with app.run_test() as pilot:
+        app.query_one("#input", ChatInput).text = "hello"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        status = app.query_one("#status")
+        text = str(status.content)
+        assert "deepseek-chat" in text
+        assert "1K/1M" in text  # 1500 // 1000 = 1
+        assert "(0.1%)" in text  # 1500 / 1_000_000 * 100 = 0.15, :.1f → 0.1
+
+
+@pytest.mark.asyncio
+async def test_clear_refreshes_status_bar_to_zero(app):
+    """After /clear, status bar shows 0K/1M (0.0%), not 就绪."""
+    app._cumulative_input_tokens = 99999
+    async with app.run_test() as pilot:
+        app.query_one("#input", ChatInput).text = "/clear"
+        await pilot.press("enter")
+        await pilot.pause()
+        status = app.query_one("#status")
+        text = str(status.content)
+        assert "0K/1M" in text
+        assert "(0.0%)" in text

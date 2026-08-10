@@ -81,8 +81,8 @@ def _messages_to_text(messages: list) -> str:
 
 def _write_report_file(stock_code: str, period: str, content: str) -> Path:
     """写入报告文件并 set_current_report。返回文件路径。"""
-    reports_dir = Path.cwd() / "reports"
-    reports_dir.mkdir(exist_ok=True)
+    reports_dir = Path.cwd() / ".finagent" / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
     period_safe = re.sub(r"[^\w一-鿿]", "", period)
     filepath = reports_dir / f"{stock_code}_{period_safe}_点评.md"
     filepath.write_text(content, encoding="utf-8")

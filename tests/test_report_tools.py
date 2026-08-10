@@ -123,7 +123,7 @@ def test_generate_report_core_writes_file_and_sets_state(monkeypatch, tmp_path):
 
     assert "002415" in filepath
     assert "事件概述" in content
-    assert (tmp_path / "reports").exists()
+    assert (tmp_path / ".finagent" / "reports").exists()
     assert get_current_report() is not None
     assert "002415" in str(get_current_report())
 

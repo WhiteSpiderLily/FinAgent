@@ -1,6 +1,8 @@
 """tests/test_report.py"""
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 from finagent.report import generate_report, _messages_to_text
+import finagent.report as report_mod
 
 
 _FAKE_MESSAGES = [
@@ -41,3 +43,16 @@ def test_messages_to_text_handles_langchain_types():
     assert "助手" in text
     assert "[human]" not in text
     assert "[ai]" not in text
+
+
+def test_write_report_file_uses_finagent_reports_dir(tmp_path, monkeypatch):
+    """Reports must land under ./.finagent/reports/, not legacy ./reports/."""
+    monkeypatch.setattr(Path, "cwd", lambda: tmp_path)
+    # Ensure clean state
+    monkeypatch.setattr(report_mod, "_current_report_path", None)
+
+    filepath = report_mod._write_report_file("002415", "2024Q3", "# title\n\n## 一、事件概述\nbody")
+    assert filepath.parent == tmp_path / ".finagent" / "reports"
+    assert filepath.exists()
+    # Legacy path must NOT be created
+    assert not (tmp_path / "reports").exists()

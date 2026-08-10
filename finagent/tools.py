@@ -8,6 +8,7 @@ from finagent.report import (
     update_section,
     delete_section,
 )
+from finagent.skills import read_skill_md, get_finagent_roots
 
 
 def _fmt_yi(value) -> str:
@@ -262,9 +263,52 @@ def get_fund_flow(stock_code: str) -> str:
     return "\n".join(lines)
 
 
+@tool
+def load_skill(name: str) -> str:
+    """加载指定 skill 的完整指令。
+
+    可用 skill 列表见每轮 system-reminder 中的 catalog。激活后该 skill 的指令
+    在后续对话中持续生效。可同时激活多个 skill。
+
+    Args:
+        name: skill 名称(catalog 中列出的 name)
+    """
+    try:
+        return read_skill_md(name)
+    except FileNotFoundError:
+        return f"未找到 skill: {name}。请检查 system-reminder 中的可用列表或 /reload_skills 后重试。"
+
+
+@tool
+def read_file(path: str) -> str:
+    """读取 .finagent/ 路径下的文件(沙箱内)。
+
+    path 相对于 .finagent/ 根目录(如 'skills/news-radar/assets/tpl.md')。
+    自动在 ./.finagent 和 ~/.finagent 两处查找,项目本地优先。禁止读取沙箱外文件。
+
+    Args:
+        path: 相对 .finagent/ 的路径
+    """
+    for root in get_finagent_roots():
+        candidate = (root / path).resolve()
+        # Reject escape: resolved path must live under this root
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            # Path escapes this root's sandbox
+            continue
+        if candidate.is_file():
+            try:
+                return candidate.read_text(encoding="utf-8")
+            except OSError as e:
+                return f"读取失败: {e}"
+    return f"禁止访问: {path} (超出沙箱或未找到)"
+
+
 tools = [
     get_company_info, get_financials, get_valuation,
     get_industry_ranking, get_research_reports,
     get_holder_change, get_dividend_history, get_fund_flow,
     generate_report_tool, read_report, update_section, delete_section,
+    load_skill, read_file,
 ]

@@ -2,6 +2,9 @@
 import os
 from dotenv import load_dotenv
 
+MODEL_NAME = "deepseek-chat"
+CONTEXT_WINDOW_TOKENS = 1_000_000
+
 
 def load_env():
     """Load .env file if present."""
