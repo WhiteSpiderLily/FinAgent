@@ -26,3 +26,18 @@ def reset_checkpoint() -> None:
     """重置 checkpointer，使 /clear 后新对话从干净状态开始。"""
     global _checkpointer
     _checkpointer = MemorySaver()
+
+
+def create_agent_with_history(thread_id: str, messages: list):
+    """Build agent, pre-seed checkpointer with message history.
+
+    Uses update_state to write messages into checkpoint without
+    triggering graph execution. The agent's add_messages reducer
+    deduplicates by message id.
+    """
+    agent = create_agent()
+    agent.update_state(
+        {"configurable": {"thread_id": thread_id}},
+        {"messages": messages},
+    )
+    return agent

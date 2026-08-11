@@ -710,3 +710,117 @@ async def test_clear_refreshes_status_bar_to_zero(app):
         text = str(status.content)
         assert "0K/1M" in text
         assert "(0.0%)" in text
+
+
+@pytest.mark.asyncio
+async def test_memory_injected_on_first_message(app, tmp_path, monkeypatch):
+    """First user message in a session includes memory content."""
+    from finagent.memory import MemoryLoader
+
+    mem_file = tmp_path / "finagent.md"
+    mem_file.write_text("# 项目记忆\nA股规则", encoding="utf-8")
+    app._memory_loader = MemoryLoader(files=[("test", mem_file)])
+
+    captured = []
+    async def fake_astream(*args, **kwargs):
+        captured.append(args[0])
+        return
+        yield
+
+    app.agent.astream = fake_astream
+    async with app.run_test() as pilot:
+        app.query_one("#input", ChatInput).text = "hello"
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert captured
+    content = captured[0]["messages"][0]["content"]
+    assert "项目记忆" in content
+    assert "<system-reminder>" in content
+
+
+@pytest.mark.asyncio
+async def test_memory_not_injected_when_unchanged(app, tmp_path):
+    """After first injection, unchanged files don't re-inject."""
+    from finagent.memory import MemoryLoader
+
+    mem_file = tmp_path / "finagent.md"
+    mem_file.write_text("memory content", encoding="utf-8")
+    app._memory_loader = MemoryLoader(files=[("test", mem_file)])
+
+    captured = []
+    async def fake_astream(*args, **kwargs):
+        captured.append(args[0])
+        return
+        yield
+
+    app.agent.astream = fake_astream
+    async with app.run_test() as pilot:
+        # First message: memory injected
+        app.query_one("#input", ChatInput).text = "first"
+        await pilot.press("enter")
+        await pilot.pause()
+        # Second message: no change, memory not re-injected
+        app.query_one("#input", ChatInput).text = "second"
+        await pilot.press("enter")
+        await pilot.pause()
+
+    first_content = captured[0]["messages"][0]["content"]
+    second_content = captured[1]["messages"][0]["content"]
+    assert "memory content" in first_content
+    assert "memory content" not in second_content
+
+
+@pytest.mark.asyncio
+async def test_session_written_after_stream(app, tmp_path, monkeypatch):
+    """After a successful stream, session JSONL is written."""
+    from langchain_core.messages import AIMessage, HumanMessage
+    from unittest.mock import patch, MagicMock
+
+    monkeypatch.setattr("finagent.session.SESSIONS_DIR", tmp_path)
+    # Also patch the import in tui to use this dir
+    app.thread_id = "test-persist"
+
+    fake_state = MagicMock()
+    fake_state.values = {
+        "messages": [HumanMessage(content="hi", id="m1")]
+    }
+    app.agent.get_state = MagicMock(return_value=fake_state)
+
+    async def fake_astream(*args, **kwargs):
+        yield ("messages", (AIMessageChunk(content="reply"), {}))
+        ai = AIMessage(content="reply", usage_metadata={"input_tokens": 100, "output_tokens": 10, "total_tokens": 110})
+        yield ("updates", {"agent": {"messages": [ai]}})
+
+    app.agent.astream = fake_astream
+    async with app.run_test() as pilot:
+        app.query_one("#input", ChatInput).text = "hello"
+        await pilot.press("enter")
+        await pilot.app.workers.wait_for_complete()
+        await pilot.pause()
+
+    # write_session was called (mocked by conftest, check call args)
+    # Verify via the mock
+    from finagent.tui import write_session
+    write_session.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_do_clear_resets_memory_loader(app):
+    """/clear resets MemoryLoader so next message re-injects memory."""
+    from unittest.mock import MagicMock
+    app._memory_loader = MagicMock()
+    async with app.run_test() as pilot:
+        app.query_one("#input", ChatInput).text = "/clear"
+        await pilot.press("enter")
+        await pilot.pause()
+    app._memory_loader.reset.assert_called_once()
+
+
+def test_finagent_app_accepts_resume_id():
+    """FinAgentApp.__init__ accepts resume_session_id parameter."""
+    with patch("finagent.tui.create_agent", return_value=MagicMock()), \
+         patch("finagent.tui.create_agent_with_history", return_value=MagicMock()), \
+         patch("finagent.tui.load_session", return_value=([], 0)):
+        app = FinAgentApp(resume_session_id="some-id")
+        assert app.thread_id == "some-id"

@@ -94,17 +94,29 @@ def _format_current_period(profit_row, balance_row, cashflow_row) -> str:
 
 
 def _format_trend(profit_df, balance_df, n=8) -> str:
-    """Compute 8-period trend for 5 ratios, return compact table."""
-    merged = profit_df[["REPORT_DATE", "OPERATE_INCOME", "OPERATE_COST", "PARENT_NETPROFIT"]].copy()
-    bal = balance_df[["REPORT_DATE", "TOTAL_LIABILITIES", "TOTAL_ASSETS", "TOTAL_PARENT_EQUITY"]].copy()
+    """Compute 8-period trend for 5 ratios, return compact table.
+
+    Filters to available columns — bank stocks lack OPERATE_COST (use 营业支出
+    instead), so gross margin shows N/A for those.
+    """
+    profit_cols = [c for c in ["REPORT_DATE", "OPERATE_INCOME", "OPERATE_COST", "PARENT_NETPROFIT"]
+                   if c in profit_df.columns]
+    bal_cols = [c for c in ["REPORT_DATE", "TOTAL_LIABILITIES", "TOTAL_ASSETS", "TOTAL_PARENT_EQUITY"]
+                if c in balance_df.columns]
+    if "REPORT_DATE" not in profit_cols or "REPORT_DATE" not in bal_cols:
+        return "（趋势数据不可用）"
+    merged = profit_df[profit_cols].copy()
+    bal = balance_df[bal_cols].copy()
     merged = merged.merge(bal, on="REPORT_DATE", how="inner")
     merged = merged.sort_values("REPORT_DATE", ascending=False).head(n)
     lines = [f"近 {len(merged)} 期趋势:"]
     lines.append(f"{'报告期':<12} {'毛利率%':>7} {'净利率%':>7} {'负债率%':>7} {'ROE%':>7}")
     for _, r in merged.iterrows():
-        gm = (r["OPERATE_INCOME"] - r["OPERATE_COST"]) / r["OPERATE_INCOME"] * 100 if r["OPERATE_INCOME"] else None
-        nm = r["PARENT_NETPROFIT"] / r["OPERATE_INCOME"] * 100 if r["OPERATE_INCOME"] else None
-        dr = r["TOTAL_LIABILITIES"] / r["TOTAL_ASSETS"] * 100 if r["TOTAL_ASSETS"] else None
+        income = r.get("OPERATE_INCOME")
+        cost = r.get("OPERATE_COST")
+        gm = (income - cost) / income * 100 if income and cost else None
+        nm = r["PARENT_NETPROFIT"] / income * 100 if income else None
+        dr = r["TOTAL_LIABILITIES"] / r["TOTAL_ASSETS"] * 100 if r.get("TOTAL_ASSETS") else None
         roe = r["PARENT_NETPROFIT"] / r["TOTAL_PARENT_EQUITY"] * 100 if r.get("TOTAL_PARENT_EQUITY") else None
         date_short = str(r["REPORT_DATE"])[:10]
         lines.append(f"{date_short:<12} {_fmt_trend_val(gm)} {_fmt_trend_val(nm)} {_fmt_trend_val(dr)} {_fmt_trend_val(roe)}")

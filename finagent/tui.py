@@ -13,9 +13,12 @@ from textual.worker import get_current_worker
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from finagent.agent import create_agent, reset_checkpoint
+from finagent.agent import create_agent, create_agent_with_history, reset_checkpoint
 from finagent.config import load_env, MODEL_NAME, CONTEXT_WINDOW_TOKENS
+from finagent.governance import extract_from_turn, run_governance, check_governance_needed
+from finagent.memory import MemoryLoader
 from finagent.report import generate_report, set_current_report
+from finagent.session import write_session, load_session, count_sessions
 from finagent.skills import read_skill_md, render_catalog, scan_skills
 
 HELP_TEXT = """\
@@ -80,14 +83,23 @@ class FinAgentApp(App):
 
     BINDINGS = [Binding("escape", "interrupt", "中断")]
 
-    def __init__(self):
+    def __init__(self, resume_session_id: str | None = None):
         super().__init__()
         load_env()
-        self.thread_id = str(uuid.uuid4())
-        self.agent = create_agent()
+        self._memory_loader = MemoryLoader()
+        if resume_session_id:
+            messages, tokens = load_session(resume_session_id)
+            self.thread_id = resume_session_id
+            self._cumulative_input_tokens = tokens
+            self.agent = create_agent_with_history(self.thread_id, messages)
+            self._resume_messages = messages
+        else:
+            self.thread_id = str(uuid.uuid4())
+            self.agent = create_agent()
+            self._cumulative_input_tokens = 0
+            self._resume_messages = None
         self._queue: list[tuple[str, Static]] = []
         self._streaming_worker = None
-        self._cumulative_input_tokens: int = 0
         # Skill catalog (refreshed by /reload_skills and at startup)
         metas = scan_skills()
         self._skill_catalog_names: frozenset[str] = frozenset(metas.keys())
@@ -102,9 +114,24 @@ class FinAgentApp(App):
     def on_mount(self) -> None:
         # chat-view must not steal keyboard focus from the input box
         self.query_one("#chat-view").can_focus = False
-        self._add_message("输入股票代码 + 报告期开始分析。输入 /help 查看命令。")
+        # Render resumed conversation history into chat view
+        if self._resume_messages:
+            self._add_message("— 恢复历史会话 —", classes="message-queued")
+            from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+            for msg in self._resume_messages:
+                if isinstance(msg, HumanMessage) and msg.content:
+                    self._add_message(f"> {msg.content}", classes="message-user")
+                elif isinstance(msg, AIMessage) and msg.content:
+                    self._add_message(msg.content)
+                elif isinstance(msg, ToolMessage):
+                    self._add_message(f"🔧 {msg.name} ✓", classes="message-tool")
+            self._add_message("— 继续对话 —", classes="message-queued")
+            self._resume_messages = None
+        else:
+            self._add_message("输入股票代码 + 报告期开始分析。输入 /help 查看命令。")
         self.query_one("#input").focus()
         self._refresh_status_bar()
+        self._run_governance_check()
 
     def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
         text = event.value.strip()
@@ -156,18 +183,23 @@ class FinAgentApp(App):
             self._streaming_worker = self._start_stream(text)
 
     def _build_user_message(self, user_input: str) -> str:
-        """Wrap user input with skill catalog as system-reminder suffix.
+        """Wrap user input with memory + skill catalog as system-reminder suffixes."""
+        parts = [user_input]
 
-        System prompt is intentionally left untouched to preserve DeepSeek
-        prompt-cache hits; catalog rides in the user message.
-        """
-        return (
-            f"{user_input}\n\n"
+        # Memory injection (conditional on mtime change)
+        memory_content = self._memory_loader.get_injectable()
+        if memory_content:
+            parts.append(f"<system-reminder>\n{memory_content}\n</system-reminder>")
+
+        # Skill catalog (every turn)
+        parts.append(
             f"<system-reminder>\n"
             f"可用 skills(用 load_skill 工具加载,或用户输入 /<name>):\n"
             f"{self._skill_catalog}\n"
             f"</system-reminder>"
         )
+
+        return "\n\n".join(parts)
 
     @work
     async def _start_stream(self, user_input: str) -> None:
@@ -252,6 +284,18 @@ class FinAgentApp(App):
                 return
             self._refresh_status_bar()
             self._streaming_worker = None
+
+            # Session persistence (best-effort)
+            try:
+                state = self.agent.get_state(
+                    config={"configurable": {"thread_id": self.thread_id}}
+                )
+                msgs = state.values.get("messages", [])
+                write_session(self.thread_id, msgs, self._cumulative_input_tokens)
+                self._run_extraction(msgs)
+            except Exception:
+                pass  # persistence is best-effort; don't crash UI
+
             # remove queued message widgets and flush merged queue
             if self._queue:
                 for _text, w in self._queue:
@@ -284,6 +328,8 @@ class FinAgentApp(App):
         self._queue.clear()
         self.query_one("#chat-view").remove_children()
         self._refresh_status_bar()
+        self._memory_loader.reset()
+        self._run_governance_check()
 
     def _do_reload_skills(self) -> None:
         """Rescan skill directories, refresh in-memory catalog."""
@@ -327,6 +373,28 @@ class FinAgentApp(App):
                 title = line.lstrip("#").strip()
                 break
         self._add_message(f"✓ skill 已加载: {name} — {title}", classes="message-tool")
+
+    @work
+    async def _run_extraction(self, messages: list) -> None:
+        """Per-turn memory extraction. Async, non-blocking."""
+        try:
+            await extract_from_turn(messages)
+        except Exception as e:
+            self._set_status(f"记忆提取失败: {e}")
+            self._refresh_status_bar()
+
+    @work
+    async def _run_governance_check(self) -> None:
+        """Check if governance is needed, run if so."""
+        if not check_governance_needed():
+            return
+        self._set_status("记忆治理中...")
+        try:
+            await run_governance()
+        except Exception as e:
+            self._add_message(f"治理失败: {e}", classes="message-error")
+        finally:
+            self._refresh_status_bar()
 
     @work(thread=True)
     def _do_report(self) -> None:
@@ -386,5 +454,17 @@ def main():
     # 'spawn' start method needs to pass these fds to child processes, which fails
     # with "bad value(s) in fds_to_keep". 'fork' inherits fds without spawning.
     multiprocessing.set_start_method("fork", force=True)
-    app = FinAgentApp()
+
+    import argparse
+    parser = argparse.ArgumentParser(description="FinAgent — A股财报点评助手")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="恢复指定 session ID")
+    args = parser.parse_args()
+
+    app = FinAgentApp(resume_session_id=args.resume)
     app.run()
+
+    # Print resume hint on exit
+    if app.thread_id:
+        print(f"\nResume this session with:\n"
+              f"python -m finagent --resume {app.thread_id}")
