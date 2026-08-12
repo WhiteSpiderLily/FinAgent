@@ -6,18 +6,23 @@ os.environ.setdefault("TQDM_DISABLE", "1")
 
 import requests
 
-_orig_get = requests.get
+_AKSHARE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+_orig_session_init = requests.Session.__init__
 
 
-def _ua_get(url, **kwargs):
-    kwargs.setdefault("headers", {}).setdefault(
-        "User-Agent",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    )
-    return _orig_get(url, **kwargs)
+def _session_init_with_ua(self, *args, **kwargs):
+    """Patch Session.__init__ so all HTTP clients get a browser UA.
+
+    akshare calls requests.get() internally without setting User-Agent.
+    Some APIs reject the default python-requests/* UA, so we replace it
+    with a browser string. Sessions with a custom UA are not affected.
+    """
+    _orig_session_init(self, *args, **kwargs)
+    if self.headers.get("User-Agent", "").startswith("python-requests/"):
+        self.headers["User-Agent"] = _AKSHARE_UA
 
 
-requests.get = _ua_get
+requests.Session.__init__ = _session_init_with_ua
 
 import akshare as ak
 

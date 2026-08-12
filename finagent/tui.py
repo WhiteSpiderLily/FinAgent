@@ -11,7 +11,7 @@ from textual.message import Message
 from textual.widgets import Static, TextArea
 from textual.worker import get_current_worker
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
 from finagent.agent import create_agent, create_agent_with_history, reset_checkpoint
 from finagent.config import load_env, MODEL_NAME, CONTEXT_WINDOW_TOKENS
@@ -117,7 +117,6 @@ class FinAgentApp(App):
         # Render resumed conversation history into chat view
         if self._resume_messages:
             self._add_message("— 恢复历史会话 —", classes="message-queued")
-            from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
             for msg in self._resume_messages:
                 if isinstance(msg, HumanMessage) and msg.content:
                     self._add_message(f"> {msg.content}", classes="message-user")
@@ -201,6 +200,40 @@ class FinAgentApp(App):
 
         return "\n\n".join(parts)
 
+    def _handle_update_msg(self, msg, reply_widget, buffer, tool_widgets, tool_names):
+        """Process one message from updates stream.
+
+        Returns (need_new_reply, last_ai_msg, reply_widget, buffer).
+        reply_widget may be modified (empty widget removed on tool_call);
+        buffer is returned unchanged.
+        """
+        need_new_reply = False
+        last_ai_msg = None
+
+        tool_calls = getattr(msg, "tool_calls", None)
+        if tool_calls:
+            if reply_widget is not None and not buffer:
+                reply_widget.remove()
+                reply_widget = None
+            for tc in tool_calls:
+                name = tc.get("name", "tool")
+                tc_id = tc.get("id", "")
+                tool_names[tc_id] = name
+                tool_widgets[tc_id] = self._add_message(
+                    f"🔧 {name} ⏳", classes="message-tool"
+                )
+        elif hasattr(msg, "tool_call_id"):
+            w = tool_widgets.pop(msg.tool_call_id, None)
+            name = tool_names.pop(msg.tool_call_id, getattr(msg, "name", "tool"))
+            if w is not None:
+                w.update(f"🔧 {name} ✓")
+            need_new_reply = True
+
+        if isinstance(msg, AIMessage) and getattr(msg, "usage_metadata", None):
+            last_ai_msg = msg
+
+        return need_new_reply, last_ai_msg, reply_widget, buffer
+
     @work
     async def _start_stream(self, user_input: str) -> None:
         """Stream agent response: tool-call progress + token-by-token reply.
@@ -228,6 +261,11 @@ class FinAgentApp(App):
                     break
                 if mode == "messages":
                     chunk, _metadata = data
+                    # Deep Agents: task tool's ToolMessage carries subagent
+                    # analysis text in messages stream. Skip non-AIMessageChunk
+                    # to only render coordinator streaming tokens.
+                    if not isinstance(chunk, AIMessageChunk):
+                        continue
                     content = getattr(chunk, "content", "")
                     has_tool_calls = bool(getattr(chunk, "tool_call_chunks", None))
                     if content and not has_tool_calls:
@@ -242,30 +280,15 @@ class FinAgentApp(App):
                             last_update = now
                 elif mode == "updates":
                     for node, state in data.items():
+                        if state is None:
+                            continue
                         for msg in state.get("messages", []):
-                            tool_calls = getattr(msg, "tool_calls", None)
-                            if tool_calls:
-                                if reply_widget is not None and not buffer:
-                                    reply_widget.remove()
-                                    reply_widget = None
-                                for tc in tool_calls:
-                                    name = tc.get("name", "tool")
-                                    tc_id = tc.get("id", "")
-                                    tool_names[tc_id] = name
-                                    w = self._add_message(
-                                        f"🔧 {name} ⏳", classes="message-tool"
-                                    )
-                                    tool_widgets[tc_id] = w
-                            elif hasattr(msg, "tool_call_id"):
-                                w = tool_widgets.pop(msg.tool_call_id, None)
-                                name = tool_names.pop(
-                                    msg.tool_call_id, getattr(msg, "name", "tool")
-                                )
-                                if w is not None:
-                                    w.update(f"🔧 {name} ✓")
-                                need_new_reply = True
-                            if type(msg).__name__ == "AIMessage" and getattr(msg, "usage_metadata", None):
-                                last_ai_msg = msg
+                            nr, lai, reply_widget, buffer = self._handle_update_msg(
+                                msg, reply_widget, buffer, tool_widgets, tool_names
+                            )
+                            need_new_reply = need_new_reply or nr
+                            if lai:
+                                last_ai_msg = lai
             if buffer and reply_widget is not None:
                 reply_widget.update(buffer)
             elif reply_widget is not None:
