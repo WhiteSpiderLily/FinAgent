@@ -12,6 +12,7 @@ dependencies = [
     "rich>=13.0",
     "python-dotenv>=1.0",
     "textual>=0.40",
+    "deepagents>=0.7.5,<0.8",
 ]
 
 [project.optional-dependencies]

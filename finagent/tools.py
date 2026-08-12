@@ -292,7 +292,7 @@ def load_skill(name: str) -> str:
 
 
 @tool
-def read_file(path: str) -> str:
+def read_sandbox_file(path: str) -> str:
     """读取 .finagent/ 路径下的文件(沙箱内)。
 
     path 相对于 .finagent/ 根目录(如 'skills/news-radar/assets/tpl.md')。
@@ -322,5 +322,5 @@ tools = [
     get_industry_ranking, get_research_reports,
     get_holder_change, get_dividend_history, get_fund_flow,
     generate_report_tool, read_report, update_section, delete_section,
-    load_skill, read_file,
+    load_skill, read_sandbox_file,
 ]

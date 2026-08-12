@@ -246,12 +246,12 @@ def test_get_fund_flow():
     assert "主力" in result
 
 
-# --- Tests for skill-related tools (load_skill, read_file). ---
+# --- Tests for skill-related tools (load_skill, read_sandbox_file). ---
 from pathlib import Path
 from unittest.mock import patch
 
 from finagent import skills
-from finagent.tools import load_skill, read_file
+from finagent.tools import load_skill, read_sandbox_file
 
 
 SKILL_BODY = """---
@@ -285,36 +285,36 @@ def test_load_skill_rejects_traversal_name():
     assert "未找到" in out or "not found" in out.lower()
 
 
-def test_read_file_within_sandbox(tmp_path, monkeypatch):
+def test_read_sandbox_file_within_sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "cwd", lambda: tmp_path)
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "fakehome")
     target = tmp_path / ".finagent" / "skills" / "x" / "assets" / "a.md"
     target.parent.mkdir(parents=True)
     target.write_text("hello", encoding="utf-8")
 
-    out = read_file.invoke({"path": "skills/x/assets/a.md"})
+    out = read_sandbox_file.invoke({"path": "skills/x/assets/a.md"})
     assert out == "hello"
 
 
-def test_read_file_sandbox_escape_rejected(tmp_path, monkeypatch):
+def test_read_sandbox_file_sandbox_escape_rejected(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "cwd", lambda: tmp_path)
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "fakehome")
     # Place a real file outside the sandbox to make the escape attempt concrete
     secret = tmp_path / "secret.txt"
     secret.write_text("root creds", encoding="utf-8")
 
-    out = read_file.invoke({"path": "../secret.txt"})
+    out = read_sandbox_file.invoke({"path": "../secret.txt"})
     assert "禁止" in out or "denied" in out.lower() or "invalid" in out.lower()
 
 
-def test_read_file_not_found(tmp_path, monkeypatch):
+def test_read_sandbox_file_not_found(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "cwd", lambda: tmp_path)
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "fakehome")
-    out = read_file.invoke({"path": "nope/missing.md"})
+    out = read_sandbox_file.invoke({"path": "nope/missing.md"})
     assert "未找到" in out or "not found" in out.lower()
 
 
-def test_read_file_prefers_project(tmp_path, monkeypatch):
+def test_read_sandbox_file_prefers_project(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "cwd", lambda: tmp_path)
     fake_home = tmp_path / "fakehome"
     fake_home.mkdir()
@@ -326,5 +326,5 @@ def test_read_file_prefers_project(tmp_path, monkeypatch):
     p.parent.mkdir(parents=True)
     p.write_text("project", encoding="utf-8")
 
-    out = read_file.invoke({"path": "shared.md"})
+    out = read_sandbox_file.invoke({"path": "shared.md"})
     assert out == "project"
