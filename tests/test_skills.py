@@ -178,3 +178,22 @@ def test_read_skill_md_rejects_traversal_name(tmp_path, monkeypatch):
 
     with pytest.raises(FileNotFoundError):
         skills.read_skill_md("../escape")
+
+
+def test_earnings_review_skill_discovered():
+    """scan_skills keys are skill names — 'earnings-review' must be present."""
+    from finagent.skills import scan_skills
+    assert "earnings-review" in scan_skills()
+
+
+def test_earnings_review_template_readable():
+    """Template asset must exist and contain the six-section structure."""
+    from finagent.skills import get_finagent_roots
+    for root in get_finagent_roots():
+        path = root / "skills" / "earnings-review" / "assets" / "report-template.md"
+        if path.is_file():
+            content = path.read_text(encoding="utf-8")
+            assert "## 一、事件概述" in content
+            assert "## 六、免责声明" in content
+            return
+    raise AssertionError("report-template.md not found in any finagent root")

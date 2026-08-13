@@ -75,7 +75,7 @@ description: 一句话描述,出现在每轮 system-reminder 的 catalog 中
 ### 激活 skill
 
 - 用户输入 `/<skill-name>`(如 `/my-skill`)
-- 或让 agent 调用 `load_skill(name="my-skill")` 工具
+- 或让 agent 调用 `read_file('.finagent/skills/<skill-name>/skill.md')`
 - 两种方式产出等价的对话历史
 
 ### 渐进式披露

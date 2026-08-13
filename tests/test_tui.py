@@ -50,7 +50,7 @@ def test_parse_command_slash_commands():
     assert parse_command("/help") == ("help", "")
     assert parse_command("/quit") == ("quit", "")
     assert parse_command("/clear") == ("clear", "")
-    assert parse_command("/report") == ("report", "")
+    assert parse_command("/reload_skills") == ("reload_skills", "")
 
 
 def test_parse_command_case_insensitive():
@@ -122,7 +122,7 @@ async def test_streaming_shows_tool_progress():
             await pilot.app.workers.wait_for_complete()
             await pilot.pause()
             chat = app.query_one("#chat-view")
-            messages = [str(c.content) for c in chat.children if isinstance(c, Static)]
+            messages = [str(c.content) for c in chat.query(Static)]
             # tool progress line with tool name + checkmark
             assert any("get_financials" in m and "✓" in m for m in messages)
 
@@ -162,18 +162,23 @@ async def test_tool_call_interleaved_between_text_segments():
             await pilot.app.workers.wait_for_complete()
             await pilot.pause()
             chat = app.query_one("#chat-view")
-            messages = [str(c.content) for c in chat.children if isinstance(c, Static)]
+            messages = [str(c.content) for c in chat.query(Static)]
             # 需求1: 单个工具 widget，⏳ 被替换为 ✓
             tool_msgs = [m for m in messages if "get_financials" in m]
             assert len(tool_msgs) == 1, f"expected 1 tool widget, got {tool_msgs}"
             assert "✓" in tool_msgs[0]
             assert "⏳" not in tool_msgs[0]
-            # 需求2: 工具调用夹在两段文本之间
-            idx_before = next(i for i, m in enumerate(messages) if "前半段" in m)
-            idx_tool = next(i for i, m in enumerate(messages) if "get_financials" in m)
-            idx_after = next(i for i, m in enumerate(messages) if "后半段" in m)
-            assert idx_before < idx_tool < idx_after
-            assert idx_before != idx_after
+            # 需求2: 两段文本都存在（折叠后顺序不保证）
+            assert any("前半段" in m for m in messages)
+            assert any("后半段" in m for m in messages)
+            # 需求3: 结构验证——"前半段"在 Collapsible 内，"后半段"在 Collapsible 外
+            from textual.widgets import Collapsible
+            collapsibles = list(chat.query(Collapsible))
+            if collapsibles:
+                inside = [str(c.content) for c in collapsibles[0].query(Static)]
+                outside = [str(c.content) for c in chat.children if isinstance(c, Static)]
+                assert any("前半段" in m for m in inside), "前半段 should be inside Collapsible"
+                assert any("后半段" in m for m in outside), "后半段 should be outside Collapsible"
 
 
 @pytest.mark.asyncio
@@ -240,95 +245,6 @@ async def test_clear_command(app):
         chat = app.query_one("#chat-view")
         after_count = len([c for c in chat.children if isinstance(c, Static)])
         assert after_count == 0
-
-
-@pytest.mark.asyncio
-async def test_report_command_shows_summary():
-    fake_content = "# 海康威视(002415) 2024Q3财报点评\n\n## 一、事件概述\n..."
-    with patch("finagent.tui.generate_report", return_value=("/tmp/report.md", fake_content)):
-        with patch("finagent.tui.create_agent", return_value=MagicMock()):
-            app = FinAgentApp()
-            async with app.run_test() as pilot:
-                app.query_one("#input", ChatInput).text = "/report"
-                await pilot.press("enter")
-                # /report runs in a thread worker now; wait for it to drain
-                await pilot.app.workers.wait_for_complete()
-                await pilot.pause()
-                chat = app.query_one("#chat-view")
-                messages = [str(c.content) for c in chat.children if isinstance(c, Static)]
-                assert any("海康威视" in m for m in messages)
-                assert any("/tmp/report.md" in m for m in messages)
-
-
-@pytest.mark.asyncio
-async def test_report_command_injects_path_message():
-    """/report 成功后向 agent checkpoint 注入报告路径 message。"""
-    fake_path = "/tmp/reports/002415_2024Q3_点评.md"
-    fake_content = "# 海康威视 2024Q3财报点评\n\n## 一、事件概述\n内容。"
-    fake_state = MagicMock()
-    fake_state.values = {"messages": [MagicMock(content="分析 002415")]}
-    fake_agent = MagicMock()
-    fake_agent.get_state.return_value = fake_state
-
-    with patch("finagent.tui.generate_report", return_value=(fake_path, fake_content)):
-        with patch("finagent.tui.create_agent", return_value=fake_agent):
-            app = FinAgentApp()
-            async with app.run_test() as pilot:
-                app.query_one("#input", ChatInput).text = "/report"
-                await pilot.press("enter")
-                await pilot.app.workers.wait_for_complete()
-                await pilot.pause()
-
-    fake_agent.update_state.assert_called_once()
-    call_kwargs = fake_agent.update_state.call_args.kwargs
-    injected_msgs = call_kwargs.get("values", {}).get("messages", [])
-    assert len(injected_msgs) == 1
-    assert fake_path in injected_msgs[0].content
-    # config carries thread_id so the injection lands in the right checkpoint
-    assert call_kwargs.get("config", {}).get("configurable", {}).get("thread_id") == app.thread_id
-
-
-@pytest.mark.asyncio
-async def test_report_runs_offloaded_to_worker():
-    """/report offloads generate_report to a worker so the UI never blocks.
-
-    Covers Finding 2: generate_report (sync llm.invoke) must not run on the
-    UI thread. We block the report on a threading.Event and confirm the event
-    loop is still serviced while the worker sleeps.
-    """
-    import threading
-
-    release = threading.Event()
-
-    def blocking_report(_msgs):
-        # simulate a sync 10-30s llm.invoke call
-        release.wait(timeout=2)
-        return ("/tmp/r.md", "# 标题\n")
-
-    fake_state = MagicMock()
-    fake_state.values = {"messages": [MagicMock(type="user", content="hi")]}
-    fake_agent = MagicMock()
-    fake_agent.get_state.return_value = fake_state
-
-    with patch("finagent.tui.generate_report", side_effect=blocking_report):
-        with patch("finagent.tui.create_agent", return_value=fake_agent):
-            app = FinAgentApp()
-            async with app.run_test() as pilot:
-                app.query_one("#input", ChatInput).text = "/report"
-                await pilot.press("enter")
-                # while the blocking report runs in a worker, the UI loop is
-                # still alive: status should already be updated to "正在生成报告..."
-                await pilot.pause(0.05)
-                status = str(app.query_one("#status").render() if hasattr(app.query_one("#status"), 'render') else app.query_one("#status").content)
-                assert "正在生成报告" in status
-                # release the worker and let it finish
-                release.set()
-                await pilot.app.workers.wait_for_complete()
-                await pilot.pause()
-                chat = app.query_one("#chat-view")
-                messages = [str(c.content) for c in chat.children if isinstance(c, Static)]
-                assert any("标题" in m for m in messages)
-                assert "就绪" in str(app.query_one("#status").content)
 
 
 @pytest.mark.asyncio
@@ -484,99 +400,32 @@ async def test_user_message_includes_skill_catalog(app):
     assert "demo: 测试 skill" in content
 
 
-@pytest.mark.asyncio
-async def test_activate_skill_injects_messages(app, tmp_path, monkeypatch):
-    """/<skill-name> must inject HumanMessage + ToolMessage into history."""
-    from pathlib import Path
-    from finagent import skills
-
-    fake_cwd = tmp_path / "cwd"
-    fake_cwd.mkdir()
-    (fake_cwd / ".finagent" / "skills" / "demo-skill").mkdir(parents=True)
-    (fake_cwd / ".finagent" / "skills" / "demo-skill" / "skill.md").write_text(
-        "---\nname: demo-skill\ndescription: d\n---\n# Demo\nbody content", encoding="utf-8"
-    )
-    monkeypatch.setattr(Path, "cwd", lambda: fake_cwd)
-    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
-
-    # Refresh app's catalog so /demo-skill matches
-    metas = skills.scan_skills()
-    app._skill_catalog_names = frozenset(metas.keys())
-
-    captured = {}
-    def fake_update_state(config=None, values=None):
-        captured["config"] = config
-        captured["values"] = values
-    app.agent.update_state = fake_update_state
-
-    async with app.run_test() as pilot:
-        app.query_one("#input", ChatInput).text = "/demo-skill"
-        await pilot.press("enter")
-        await pilot.pause()
-
-    assert "values" in captured
-    msgs = captured["values"].get("messages", [])
-    # Expect at least HumanMessage + ToolMessage
-    types = [type(m).__name__ for m in msgs]
-    assert "HumanMessage" in types
-    assert "ToolMessage" in types
-    # ToolMessage content should contain skill body
-    tool_msgs = [m for m in msgs if type(m).__name__ == "ToolMessage"]
-    assert any("body content" in str(getattr(m, "content", "")) for m in tool_msgs)
+def test_report_command_removed():
+    """'/report' is no longer a registered command."""
+    from finagent.tui import _COMMANDS
+    assert "/report" not in _COMMANDS
 
 
-@pytest.mark.asyncio
-async def test_activate_skill_injects_deepseek_valid_sequence(app, tmp_path, monkeypatch):
-    """_activate_skill must inject [HumanMessage, AIMessage, ToolMessage] so
-    DeepSeek sees a valid tool-call flow (ToolMessage preceded by AIMessage
-    with matching tool_calls). Current code omits the AIMessage → 400 error.
-    """
-    from pathlib import Path
-    from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-    from finagent import skills
-
-    fake_cwd = tmp_path / "cwd"
-    fake_cwd.mkdir()
-    (fake_cwd / ".finagent" / "skills" / "demo-skill").mkdir(parents=True)
-    (fake_cwd / ".finagent" / "skills" / "demo-skill" / "skill.md").write_text(
-        "---\nname: demo-skill\ndescription: d\n---\n# Demo\nbody content", encoding="utf-8"
-    )
-    monkeypatch.setattr(Path, "cwd", lambda: fake_cwd)
-    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
-
-    metas = skills.scan_skills()
-    app._skill_catalog_names = frozenset(metas.keys())
-
-    captured = {}
-    def fake_update_state(config=None, values=None):
-        captured["values"] = values
-    app.agent.update_state = fake_update_state
-
-    async with app.run_test() as pilot:
-        app.query_one("#input", ChatInput).text = "/demo-skill"
-        await pilot.press("enter")
-        await pilot.pause()
-
-    msgs = captured["values"]["messages"]
-    # Exact 3-message sequence
-    assert len(msgs) == 3, f"expected 3 messages, got {len(msgs)}"
-    assert isinstance(msgs[0], HumanMessage)
-    assert isinstance(msgs[1], AIMessage)
-    assert isinstance(msgs[2], ToolMessage)
-    # HumanMessage content
-    assert msgs[0].content == "/demo-skill"
-    # AIMessage: empty content, single load_skill tool_call with matching id
-    assert msgs[1].content == ""
-    assert len(msgs[1].tool_calls) == 1
-    tc = msgs[1].tool_calls[0]
-    assert tc["name"] == "load_skill"
-    assert tc["args"] == {"name": "demo-skill"}
-    assert tc["type"] == "tool_call"
-    tool_call_id = tc["id"]
-    # ToolMessage: matching id, name, skill.md body
-    assert msgs[2].tool_call_id == tool_call_id
-    assert msgs[2].name == "load_skill"
-    assert "body content" in msgs[2].content
+def test_activate_skill_injects_read_file_call(app):
+    """_activate_skill must emit a read_file tool call on the skill path, not load_skill."""
+    app.thread_id = "test-thread"
+    with patch.object(app, "_add_message"):
+        app._activate_skill("smoke")
+    assert app.agent.update_state.called
+    call_kwargs = app.agent.update_state.call_args
+    messages = call_kwargs.kwargs.get("values", {}).get("messages", [])
+    found = False
+    for msg in messages:
+        tcs = getattr(msg, "tool_calls", None) or []
+        for tc in tcs:
+            if tc.get("name") == "read_file":
+                path = tc.get("args", {}).get("file_path", "")
+                if "smoke" in path and "skill.md" in path:
+                    found = True
+    assert found, f"expected read_file tool call on smoke/skill.md; got messages={messages}"
+    # Preserve thread_id config — session isolation depends on it
+    config = call_kwargs.kwargs.get("config", {})
+    assert config.get("configurable", {}).get("thread_id") == "test-thread"
 
 
 @pytest.mark.asyncio
@@ -821,6 +670,223 @@ def test_finagent_app_accepts_resume_id():
     """FinAgentApp.__init__ accepts resume_session_id parameter."""
     with patch("finagent.tui.create_agent", return_value=MagicMock()), \
          patch("finagent.tui.create_agent_with_history", return_value=MagicMock()), \
-         patch("finagent.tui.load_session", return_value=([], 0)):
+         patch("finagent.tui.load_session", return_value=([], 0, [])):
         app = FinAgentApp(resume_session_id="some-id")
         assert app.thread_id == "some-id"
+
+
+from finagent.tui import strip_system_reminders
+
+
+def test_strip_system_reminders_removes_blocks():
+    content = "分析002415\n\n<system-reminder>\n记忆内容\n</system-reminder>"
+    result = strip_system_reminders(content)
+    assert "<system-reminder>" not in result
+    assert "分析002415" in result
+    assert "记忆内容" not in result
+
+
+def test_strip_system_reminders_multiple_blocks():
+    content = (
+        "原文\n\n"
+        "<system-reminder>\n块1\n</system-reminder>\n\n"
+        "<system-reminder>\n块2\n</system-reminder>"
+    )
+    result = strip_system_reminders(content)
+    assert result.strip() == "原文"
+
+
+def test_strip_system_reminders_no_blocks():
+    content = "纯文本无reminder"
+    assert strip_system_reminders(content) == "纯文本无reminder"
+
+
+def test_strip_system_reminders_only_reminders():
+    content = "<system-reminder>\n全部是reminder\n</system-reminder>"
+    assert strip_system_reminders(content).strip() == ""
+
+
+@pytest.mark.asyncio
+async def test_turns_accumulated_after_stream():
+    """After a stream with tool calls, self._turns has correct metadata."""
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+    async def fake_astream(*args, **kwargs):
+        yield ("updates", {
+            "agent": {"messages": [AIMessage(
+                content="", tool_calls=[{"name": "get_financials", "args": {}, "id": "tc1"}]
+            )]}
+        })
+        yield ("updates", {
+            "tools": {"messages": [ToolMessage(
+                content="data", tool_call_id="tc1", name="get_financials"
+            )]}
+        })
+        yield ("messages", (AIMessageChunk(content="最终回答"), {}))
+
+    fake_agent = MagicMock()
+    fake_agent.astream = fake_astream
+
+    fake_state = MagicMock()
+    fake_state.values = {"messages": [HumanMessage(content="hi", id="m1")]}
+
+    with patch("finagent.tui.create_agent", return_value=fake_agent):
+        app = FinAgentApp()
+        app.agent.get_state = MagicMock(return_value=fake_state)
+        async with app.run_test() as pilot:
+            app.query_one("#input", ChatInput).text = "test"
+            await pilot.press("enter")
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+
+    assert len(app._turns) == 1
+    turn = app._turns[0]
+    assert turn["type"] == "turn"
+    assert isinstance(turn["duration_s"], float)
+    assert turn["interrupted"] is False
+    assert isinstance(turn["msg_start"], int)
+    assert isinstance(turn["msg_end"], int)
+
+
+@pytest.mark.asyncio
+async def test_do_clear_resets_turns():
+    """_do_clear resets self._turns to empty list."""
+    with patch("finagent.tui.create_agent", return_value=MagicMock()):
+        app = FinAgentApp()
+        app._turns = [{"fake": "turn"}]
+        async with app.run_test() as pilot:
+            app.query_one("#input", ChatInput).text = "/clear"
+            await pilot.press("enter")
+            await pilot.pause()
+    assert app._turns == []
+
+
+@pytest.mark.asyncio
+async def test_collapse_creates_collapsible_with_tools():
+    """After stream with tool calls, a Collapsible widget exists in DOM."""
+    from textual.widgets import Collapsible
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    async def fake_astream(*args, **kwargs):
+        yield ("updates", {
+            "agent": {"messages": [AIMessage(
+                content="", tool_calls=[{"name": "get_financials", "args": {}, "id": "tc1"}]
+            )]}
+        })
+        yield ("updates", {
+            "tools": {"messages": [ToolMessage(
+                content="data", tool_call_id="tc1", name="get_financials"
+            )]}
+        })
+        yield ("messages", (AIMessageChunk(content="最终回答"), {}))
+
+    fake_agent = MagicMock()
+    fake_agent.astream = fake_astream
+
+    with patch("finagent.tui.create_agent", return_value=fake_agent):
+        app = FinAgentApp()
+        async with app.run_test() as pilot:
+            app.query_one("#input", ChatInput).text = "test"
+            await pilot.press("enter")
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+            chat = app.query_one("#chat-view")
+            collapsibles = list(chat.query(Collapsible))
+            assert len(collapsibles) >= 1
+            c = collapsibles[0]
+            assert "思考了" in c.title
+            assert c.collapsed is True
+
+
+@pytest.mark.asyncio
+async def test_no_collapse_without_tools():
+    """Stream without tool calls does not create a Collapsible."""
+    from textual.widgets import Collapsible
+
+    async def fake_astream(*args, **kwargs):
+        yield ("messages", (AIMessageChunk(content="简单回答"), {}))
+
+    fake_agent = MagicMock()
+    fake_agent.astream = fake_astream
+
+    with patch("finagent.tui.create_agent", return_value=fake_agent):
+        app = FinAgentApp()
+        async with app.run_test() as pilot:
+            app.query_one("#input", ChatInput).text = "test"
+            await pilot.press("enter")
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+            chat = app.query_one("#chat-view")
+            assert len(list(chat.query(Collapsible))) == 0
+
+
+@pytest.mark.asyncio
+async def test_restore_with_turns_shows_collapsibles():
+    """Restored session with turn data renders Collapsibles per turn."""
+    from textual.widgets import Collapsible
+    from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+
+    messages = [
+        HumanMessage(content="分析002415", id="m1"),
+        AIMessage(content="", tool_calls=[{"name": "get_financials", "args": {}, "id": "tc1", "type": "tool_call"}], id="m2"),
+        ToolMessage(content="营收650亿", tool_call_id="tc1", name="get_financials", id="m3"),
+        AIMessage(content="海康威视2024Q3营收同比增长。", id="m4"),
+    ]
+    turns = [
+        {"type": "turn", "duration_s": 8.0, "interrupted": False, "msg_start": 0, "msg_end": 4},
+    ]
+
+    with patch("finagent.tui.create_agent_with_history", return_value=MagicMock()), \
+         patch("finagent.tui.load_session", return_value=(messages, 500, turns)):
+        app = FinAgentApp(resume_session_id="test-restore")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.pause()
+            chat = app.query_one("#chat-view")
+            collapsibles = list(chat.query(Collapsible))
+            assert len(collapsibles) >= 1
+            assert "思考了" in collapsibles[0].title
+            # Final answer visible outside collapsible
+            statics = [str(c.content) for c in chat.query(Static)]
+            assert any("海康威视" in m for m in statics)
+
+
+@pytest.mark.asyncio
+async def test_restore_without_turns_flat_display():
+    """Restored session without turn data renders flat (no Collapsibles)."""
+    from textual.widgets import Collapsible
+    from langchain_core.messages import HumanMessage, AIMessage
+
+    messages = [
+        HumanMessage(content="hello", id="m1"),
+        AIMessage(content="world", id="m2"),
+    ]
+
+    with patch("finagent.tui.create_agent_with_history", return_value=MagicMock()), \
+         patch("finagent.tui.load_session", return_value=(messages, 0, [])):
+        app = FinAgentApp(resume_session_id="test-flat")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            chat = app.query_one("#chat-view")
+            assert len(list(chat.query(Collapsible))) == 0
+
+
+@pytest.mark.asyncio
+async def test_restore_strips_reminders():
+    """Restored HumanMessages have system-reminder blocks removed."""
+    from langchain_core.messages import HumanMessage
+
+    dirty_content = "分析002415\n\n<system-reminder>\n秘密\n</system-reminder>"
+    messages = [HumanMessage(content=dirty_content, id="m1")]
+
+    with patch("finagent.tui.create_agent_with_history", return_value=MagicMock()), \
+         patch("finagent.tui.load_session", return_value=(messages, 0, [])):
+        app = FinAgentApp(resume_session_id="test-strip")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            chat = app.query_one("#chat-view")
+            texts = [str(c.content) for c in chat.query(Static)]
+            assert any("分析002415" in t for t in texts)
+            assert not any("秘密" in t for t in texts)
+            assert not any("<system-reminder>" in t for t in texts)
