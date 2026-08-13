@@ -1,37 +1,9 @@
 """Tests for subagent module — Deep Agents dict specs."""
 from finagent.subagents import (
-    GLOBAL_TOOL_BLACKLIST,
     build_subagent_specs,
-    resolve_subagent_tools,
     BULL_SYSTEM_PROMPT,
     BEAR_SYSTEM_PROMPT,
-    FILESYSTEM_MIDDLEWARE,
 )
-
-
-class TestResolveSubagentTools:
-    """resolve_subagent_tools: all tools minus blacklist."""
-
-    def test_excludes_report_tools(self):
-        resolved = resolve_subagent_tools()
-        names = {t.name for t in resolved}
-        assert "generate_report_tool" not in names
-        assert "update_section" not in names
-        assert "delete_section" not in names
-
-    def test_excludes_sandbox_reader(self):
-        resolved = resolve_subagent_tools()
-        names = {t.name for t in resolved}
-        assert "read_sandbox_file" not in names
-
-    def test_includes_financial_tools(self):
-        resolved = resolve_subagent_tools()
-        names = {t.name for t in resolved}
-        assert "get_company_info" in names
-        assert "get_financials" in names
-        assert "get_valuation" in names
-        assert "load_skill" in names
-        assert "read_report" in names
 
 
 class TestSubagentSpecs:
@@ -85,19 +57,25 @@ class TestPrompts:
         assert "工具" in BEAR_SYSTEM_PROMPT or "tool" in BEAR_SYSTEM_PROMPT.lower()
 
 
-class TestFilesystemMiddleware:
-    def test_only_read_file(self):
-        tools = [t.name for t in FILESYSTEM_MIDDLEWARE.tools]
-        assert tools == ["read_file"]
+def test_build_subagent_specs_structure():
+    from finagent.subagents import build_subagent_specs
+    specs = build_subagent_specs()
+    assert len(specs) == 2
+    for spec in specs:
+        assert set(spec.keys()) >= {"name", "description", "system_prompt", "tools", "middleware"}
+        assert spec["name"] in {"bull", "bear"}
+        assert len(spec["tools"]) == 8
+        # Custom middleware enforces SUBAGENT_PERMISSIONS via _permissions=
+        from finagent.subagents import SUBAGENT_PERMISSIONS
+        from deepagents.middleware.filesystem import _check_fs_permission
+        assert _check_fs_permission(SUBAGENT_PERMISSIONS, "write", "/.finagent/reports/x.md") == "deny"
 
-    def test_no_execute(self):
-        tools = [t.name for t in FILESYSTEM_MIDDLEWARE.tools]
-        assert "execute" not in tools
-        assert "write_file" not in tools
-        assert "edit_file" not in tools
-        assert "delete" not in tools
-
-
+def test_deleted_symbols_gone():
+    import pytest
+    for name in ("GLOBAL_TOOL_BLACKLIST", "resolve_subagent_tools", "FILESYSTEM_MIDDLEWARE"):
+        with pytest.raises((ImportError, AttributeError)):
+            import finagent.subagents as s
+            getattr(s, name)
 
 
 class TestStripLegacyToolMessages:
@@ -110,7 +88,7 @@ class TestStripLegacyToolMessages:
             HumanMessage(content="分析600519"),
             AIMessage(content="好的"),
         ]
-        result = _strip_legacy_tool_messages(msgs, "select_agent")
+        result = _strip_legacy_tool_messages(msgs, ["select_agent"])
         assert len(result) == 2
 
     def test_strips_pure_select_agent_calls(self):
@@ -129,7 +107,7 @@ class TestStripLegacyToolMessages:
             ToolMessage(content="bull result", tool_call_id="tc1", name="select_agent"),
             AIMessage(content="综合结论"),
         ]
-        result = _strip_legacy_tool_messages(msgs, "select_agent")
+        result = _strip_legacy_tool_messages(msgs, ["select_agent"])
         assert len(result) == 2
         assert result[0].content == "分析多空"
         assert result[1].content == "综合结论"
@@ -151,7 +129,7 @@ class TestStripLegacyToolMessages:
                 ],
             ),
         ]
-        result = _strip_legacy_tool_messages(msgs, "select_agent")
+        result = _strip_legacy_tool_messages(msgs, ["select_agent"])
         assert len(result) == 1
         ai = result[0]
         assert isinstance(ai, AIMessage)
@@ -177,7 +155,7 @@ class TestStripLegacyToolMessages:
                 }],
             ),
         ]
-        result = _strip_legacy_tool_messages(msgs, "select_agent")
+        result = _strip_legacy_tool_messages(msgs, ["select_agent"])
         assert len(result) == 0
 
     def test_keeps_content_when_all_tool_calls_legacy(self):
@@ -193,10 +171,27 @@ class TestStripLegacyToolMessages:
                 }],
             ),
         ]
-        result = _strip_legacy_tool_messages(msgs, "select_agent")
+        result = _strip_legacy_tool_messages(msgs, ["select_agent"])
         assert len(result) == 1
         assert result[0].content == "这是重要的分析文本"
         assert not (result[0].tool_calls or [])
+
+    def test_strip_legacy_tool_messages_multiple_names(self):
+        """Single scan must handle multiple legacy tool names."""
+        from finagent.agent import _strip_legacy_tool_messages
+        from langchain_core.messages import AIMessage, ToolMessage
+        msgs = [
+            AIMessage(content="hi", tool_calls=[{"name": "load_skill", "args": {}, "id": "t1"}]),
+            ToolMessage(content="ok", tool_call_id="t1", name="load_skill"),
+            AIMessage(content="hi2", tool_calls=[{"name": "select_agent", "args": {}, "id": "t2"}]),
+            ToolMessage(content="ok2", tool_call_id="t2", name="select_agent"),
+            AIMessage(content="kept"),
+        ]
+        cleaned = _strip_legacy_tool_messages(msgs, ["load_skill", "select_agent"])
+        assert len(cleaned) == 3
+        assert cleaned[0].content == "hi"
+        assert cleaned[1].content == "hi2"
+        assert cleaned[2].content == "kept"
 
 
 class TestPromptIntegration:
@@ -212,5 +207,67 @@ class TestPromptIntegration:
     def test_prompt_no_select_agent(self):
         from finagent.prompts import RESEARCH_SYSTEM_PROMPT
         assert "select_agent" not in RESEARCH_SYSTEM_PROMPT
+
+
+class TestDeclarativePermissions:
+    """Declarative FilesystemPermission rules + FilesystemBackend config."""
+
+    def test_main_agent_permissions_rules(self):
+        """Rules: allow read .finagent/** + write reports/**, deny everything else."""
+        from finagent.subagents import MAIN_AGENT_PERMISSIONS
+        from deepagents.middleware.filesystem import _check_fs_permission
+        assert _check_fs_permission(MAIN_AGENT_PERMISSIONS, "read", "/etc/passwd") == "deny"
+        assert _check_fs_permission(MAIN_AGENT_PERMISSIONS, "write", "/tmp/x") == "deny"
+        assert _check_fs_permission(MAIN_AGENT_PERMISSIONS, "write",
+                                    "/.finagent/reports/002415_2024Q3_点评.md") == "allow"
+        assert _check_fs_permission(MAIN_AGENT_PERMISSIONS, "read", "/.finagent") == "allow"
+
+    def test_subagent_permissions_readonly(self):
+        from finagent.subagents import SUBAGENT_PERMISSIONS
+        from deepagents.middleware.filesystem import _check_fs_permission
+        assert _check_fs_permission(SUBAGENT_PERMISSIONS, "write",
+                                    "/.finagent/reports/x.md") == "deny"
+        assert _check_fs_permission(SUBAGENT_PERMISSIONS, "read", "/.finagent") == "allow"
+
+    def test_backend_virtual_mode(self):
+        from finagent.subagents import BACKEND
+        from deepagents.backends import FilesystemBackend
+        assert isinstance(BACKEND, FilesystemBackend)
+        assert BACKEND.virtual_mode is True
+
+    def test_permission_denial_returns_correct_toolmessage(self):
+        """Integration: a denied read_file call must produce a ToolMessage with the
+        verified format 'Error: permission denied for read on {path}'."""
+        from deepagents.middleware.filesystem import FilesystemMiddleware
+        from langchain.tools import ToolRuntime
+        from finagent.subagents import MAIN_AGENT_PERMISSIONS, BACKEND
+
+        mw = FilesystemMiddleware(backend=BACKEND, _permissions=MAIN_AGENT_PERMISSIONS)
+        read_tool = next(t for t in mw.tools if t.name == "read_file")
+        # ponytail: read_file's denied path only touches runtime.tool_call_id;
+        # call .func directly with a mock runtime — .invoke() needs framework injection.
+        runtime = ToolRuntime(
+            state=None, context=None, config={},
+            stream_writer=lambda *a, **kw: None,
+            tool_call_id="tc_test", store=None,
+        )
+        result = read_tool.func(file_path="/etc/passwd", runtime=runtime)
+        text = result.content if hasattr(result, "content") else str(result)
+        assert "permission denied" in text.lower()
+        assert "/etc/passwd" in text or "etc/passwd" in text
+
+
+def test_backend_no_double_finagent_prefix():
+    """Regression: BACKEND root_dir must NOT be '.finagent' — that combined
+    with agent paths like '.finagent/skills/...' caused on-disk double-prefix
+    '.finagent/.finagent/skills/...'. root_dir='.' lets agent paths resolve
+    correctly while permission rules enforce the .finagent/ boundary."""
+    from finagent.subagents import BACKEND
+    # Skill path as it appears in system prompt — must resolve to project's
+    # actual .finagent/skills/earnings-review/skill.md, not a nested copy.
+    r = BACKEND.read(".finagent/skills/earnings-review/skill.md")
+    assert not r.error, f"expected skill readable at .finagent/skills/...; got {r.error}"
+    assert "earnings-review" in r.file_data.get("content", "")
+
 
 

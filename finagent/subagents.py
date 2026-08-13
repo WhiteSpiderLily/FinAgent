@@ -1,22 +1,55 @@
 """Subagent definitions for Deep Agents — bull/bear debate specs."""
+from deepagents import FilesystemPermission
+from deepagents.backends import FilesystemBackend
 from deepagents.middleware.filesystem import FilesystemMiddleware
 
-# ── Global tool blacklist (subagents forbidden) ─────────────────────
+# ponytail: tools list lives in tools.py; alias avoids a second source of truth.
+from finagent.tools import tools as DATA_TOOLS
 
-GLOBAL_TOOL_BLACKLIST = frozenset({
-    "generate_report_tool",
-    "update_section",
-    "delete_section",
-    "read_sandbox_file",
-})
+# ponytail: root_dir="." so agent paths like ".finagent/skills/..." resolve to
+# <project>/.finagent/skills/... without double-prefix. virtual_mode still
+# blocks ".." traversal; permission rules enforce the .finagent/ boundary.
+BACKEND = FilesystemBackend(root_dir=".", virtual_mode=True)
 
+MAIN_AGENT_PERMISSIONS = [
+    FilesystemPermission(
+        operations=["read"],
+        paths=["/.finagent", "/.finagent/**"],
+        mode="allow",
+    ),
+    FilesystemPermission(
+        operations=["write"],
+        paths=["/.finagent/reports/**"],
+        mode="allow",
+    ),
+    FilesystemPermission(
+        operations=["read", "write"],
+        paths=["/**", "/.finagent/**"],
+        mode="deny",
+    ),
+]
 
-# ── Restricted filesystem middleware (security: no execute/write) ───
+SUBAGENT_PERMISSIONS = [
+    FilesystemPermission(
+        operations=["read"],
+        paths=["/.finagent", "/.finagent/**"],
+        mode="allow",
+    ),
+    FilesystemPermission(
+        operations=["read", "write"],
+        paths=["/**", "/.finagent/**"],
+        mode="deny",
+    ),
+]
 
-FILESYSTEM_MIDDLEWARE = FilesystemMiddleware(tools=["read_file"])
-
-
-# ── Bull / Bear system prompts ──────────────────────────────────────
+# ponytail: custom middleware replaces default filesystem middleware on subagents.
+# The spec-level `permissions=` key is intentionally omitted — enforcement comes
+# entirely from `_permissions=` here, since custom `middleware=` replaces defaults.
+SUBAGENT_MIDDLEWARE = FilesystemMiddleware(
+    backend=BACKEND,
+    _permissions=SUBAGENT_PERMISSIONS,
+    tools=["read_file"],
+)
 
 BULL_SYSTEM_PROMPT = """你是一名 A股多方分析师。从给定数据和工具结果中找出支持看多的理由。
 
@@ -39,33 +72,23 @@ BEAR_SYSTEM_PROMPT = """你是一名 A股空方分析师。从给定数据和工
 """
 
 
-# ── Tool resolution ──────────────────────────────────────────────────
-
-def resolve_subagent_tools() -> list:
-    """Return financial tools minus blacklist."""
-    from finagent.tools import tools as all_tools
-    return [t for t in all_tools if t.name not in GLOBAL_TOOL_BLACKLIST]
-
-
-# ── Deep Agents subagent specs ───────────────────────────────────────
-
 def build_subagent_specs() -> list:
     """Build Deep Agents subagent dicts. Called at agent creation, not import."""
-    # ponytail: shared list — deepagents reads but does not mutate tool lists
-    tools = resolve_subagent_tools()
+    shared = {
+        "tools": DATA_TOOLS,
+        "middleware": [SUBAGENT_MIDDLEWARE],
+    }
     return [
         {
             "name": "bull",
             "description": "多方分析师，从财务/估值/资金/行业角度给出看多理由",
             "system_prompt": BULL_SYSTEM_PROMPT,
-            "tools": tools,
-            "middleware": [FILESYSTEM_MIDDLEWARE],
+            **shared,
         },
         {
             "name": "bear",
             "description": "空方分析师，从财务/估值/资金/行业角度给出看空理由",
             "system_prompt": BEAR_SYSTEM_PROMPT,
-            "tools": tools,
-            "middleware": [FILESYSTEM_MIDDLEWARE],
+            **shared,
         },
     ]

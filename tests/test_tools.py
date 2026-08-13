@@ -246,85 +246,28 @@ def test_get_fund_flow():
     assert "主力" in result
 
 
-# --- Tests for skill-related tools (load_skill, read_sandbox_file). ---
-from pathlib import Path
-from unittest.mock import patch
-
-from finagent import skills
-from finagent.tools import load_skill, read_sandbox_file
+# --- Tests for security refactor: only 8 data tools remain. ---
 
 
-SKILL_BODY = """---
-name: news
-description: d
----
-# body line
-"""
+def test_tools_list_has_eight_data_tools():
+    """Only the 8 akshare data tools remain after security refactor."""
+    from finagent.tools import tools
+    names = sorted(t.name for t in tools)
+    expected = sorted([
+        "get_company_info", "get_financials", "get_valuation",
+        "get_industry_ranking", "get_research_reports",
+        "get_holder_change", "get_dividend_history", "get_fund_flow",
+    ])
+    assert names == expected
 
 
-def test_load_skill_returns_full_text():
-    with patch("finagent.tools.read_skill_md", return_value=SKILL_BODY) as m:
-        out = load_skill.invoke({"name": "news"})
-    assert "body line" in out
-    m.assert_called_once_with("news")
+def test_load_skill_removed():
+    import pytest
+    with pytest.raises(ImportError):
+        from finagent.tools import load_skill  # noqa: F401
 
 
-def test_load_skill_not_found_propagates_error_string():
-    """Tool layer catches FileNotFoundError and returns user-friendly string.
-
-    LangChain tools should not raise — agent sees string in tool result.
-    """
-    with patch("finagent.tools.read_skill_md", side_effect=FileNotFoundError("nope")):
-        out = load_skill.invoke({"name": "nope"})
-    assert "未找到" in out or "not found" in out.lower()
-
-
-def test_load_skill_rejects_traversal_name():
-    """load_skill tool must return not-found string for path-traversal names."""
-    out = load_skill.invoke({"name": "../escape"})
-    assert "未找到" in out or "not found" in out.lower()
-
-
-def test_read_sandbox_file_within_sandbox(tmp_path, monkeypatch):
-    monkeypatch.setattr(Path, "cwd", lambda: tmp_path)
-    monkeypatch.setattr(Path, "home", lambda: tmp_path / "fakehome")
-    target = tmp_path / ".finagent" / "skills" / "x" / "assets" / "a.md"
-    target.parent.mkdir(parents=True)
-    target.write_text("hello", encoding="utf-8")
-
-    out = read_sandbox_file.invoke({"path": "skills/x/assets/a.md"})
-    assert out == "hello"
-
-
-def test_read_sandbox_file_sandbox_escape_rejected(tmp_path, monkeypatch):
-    monkeypatch.setattr(Path, "cwd", lambda: tmp_path)
-    monkeypatch.setattr(Path, "home", lambda: tmp_path / "fakehome")
-    # Place a real file outside the sandbox to make the escape attempt concrete
-    secret = tmp_path / "secret.txt"
-    secret.write_text("root creds", encoding="utf-8")
-
-    out = read_sandbox_file.invoke({"path": "../secret.txt"})
-    assert "禁止" in out or "denied" in out.lower() or "invalid" in out.lower()
-
-
-def test_read_sandbox_file_not_found(tmp_path, monkeypatch):
-    monkeypatch.setattr(Path, "cwd", lambda: tmp_path)
-    monkeypatch.setattr(Path, "home", lambda: tmp_path / "fakehome")
-    out = read_sandbox_file.invoke({"path": "nope/missing.md"})
-    assert "未找到" in out or "not found" in out.lower()
-
-
-def test_read_sandbox_file_prefers_project(tmp_path, monkeypatch):
-    monkeypatch.setattr(Path, "cwd", lambda: tmp_path)
-    fake_home = tmp_path / "fakehome"
-    fake_home.mkdir()
-    monkeypatch.setattr(Path, "home", lambda: fake_home)
-    g = fake_home / ".finagent" / "shared.md"
-    g.parent.mkdir(parents=True)
-    g.write_text("global", encoding="utf-8")
-    p = tmp_path / ".finagent" / "shared.md"
-    p.parent.mkdir(parents=True)
-    p.write_text("project", encoding="utf-8")
-
-    out = read_sandbox_file.invoke({"path": "shared.md"})
-    assert out == "project"
+def test_read_sandbox_file_removed():
+    import pytest
+    with pytest.raises(ImportError):
+        from finagent.tools import read_sandbox_file  # noqa: F401

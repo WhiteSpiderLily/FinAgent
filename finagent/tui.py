@@ -1,5 +1,7 @@
 """FinAgent TUI — Textual terminal interface."""
+import asyncio
 import multiprocessing
+import re
 import time
 import uuid
 
@@ -8,7 +10,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.message import Message
-from textual.widgets import Static, TextArea
+from textual.widgets import Collapsible, Static, TextArea
 from textual.worker import get_current_worker
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
@@ -17,13 +19,11 @@ from finagent.agent import create_agent, create_agent_with_history, reset_checkp
 from finagent.config import load_env, MODEL_NAME, CONTEXT_WINDOW_TOKENS
 from finagent.governance import extract_from_turn, run_governance, check_governance_needed
 from finagent.memory import MemoryLoader
-from finagent.report import generate_report, set_current_report
 from finagent.session import write_session, load_session, count_sessions
-from finagent.skills import read_skill_md, render_catalog, scan_skills
+from finagent.skills import render_catalog, scan_skills
 
 HELP_TEXT = """\
 可用命令:
-  /report         生成财报点评报告（基于当前对话历史）
   /clear          清空对话记忆（换公司分析时用）
   /reload_skills  重新扫描 skill 目录，热更新可用列表
   /<skill-name>   激活指定 skill（列表见每轮 system-reminder）
@@ -31,7 +31,7 @@ HELP_TEXT = """\
   /quit           退出
 """
 
-_COMMANDS = {"/quit", "/help", "/clear", "/report", "/reload_skills"}
+_COMMANDS = {"/quit", "/help", "/clear", "/reload_skills"}
 
 
 def parse_command(text: str, skill_names: frozenset[str] = frozenset()) -> tuple[str, str]:
@@ -48,6 +48,32 @@ def parse_command(text: str, skill_names: frozenset[str] = frozenset()) -> tuple
     if stripped.startswith("/") and stripped[1:] in skill_names:
         return "skill", stripped[1:]
     return "message", stripped
+
+
+_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+
+
+def strip_system_reminders(content: str) -> str:
+    """Remove <system-reminder> blocks from message content."""
+    return _REMINDER_RE.sub("", content)
+
+
+def _static_text(w: Static) -> str:
+    """Extract text content from a Static widget for copying into Collapsible."""
+    return w.content if isinstance(w.content, str) else str(w.content)
+
+
+def _find_final_answer(messages: list):
+    """Find last AIMessage with non-empty content and no tool_calls.
+
+    Returns None if no such message exists.
+    """
+    for msg in reversed(messages):
+        if (isinstance(msg, AIMessage)
+                and msg.content
+                and not getattr(msg, "tool_calls", None)):
+            return msg
+    return None
 
 
 class ChatInput(TextArea):
@@ -88,16 +114,18 @@ class FinAgentApp(App):
         load_env()
         self._memory_loader = MemoryLoader()
         if resume_session_id:
-            messages, tokens = load_session(resume_session_id)
+            messages, tokens, turns = load_session(resume_session_id)
             self.thread_id = resume_session_id
             self._cumulative_input_tokens = tokens
             self.agent = create_agent_with_history(self.thread_id, messages)
             self._resume_messages = messages
+            self._turns = turns
         else:
             self.thread_id = str(uuid.uuid4())
             self.agent = create_agent()
             self._cumulative_input_tokens = 0
             self._resume_messages = None
+            self._turns = []
         self._queue: list[tuple[str, Static]] = []
         self._streaming_worker = None
         # Skill catalog (refreshed by /reload_skills and at startup)
@@ -117,13 +145,73 @@ class FinAgentApp(App):
         # Render resumed conversation history into chat view
         if self._resume_messages:
             self._add_message("— 恢复历史会话 —", classes="message-queued")
-            for msg in self._resume_messages:
-                if isinstance(msg, HumanMessage) and msg.content:
-                    self._add_message(f"> {msg.content}", classes="message-user")
-                elif isinstance(msg, AIMessage) and msg.content:
-                    self._add_message(msg.content)
-                elif isinstance(msg, ToolMessage):
-                    self._add_message(f"🔧 {msg.name} ✓", classes="message-tool")
+
+            if self._turns:
+                # Sanity check: indices out of bounds → flat fallback
+                max_end = max((t.get("msg_end", 0) for t in self._turns), default=0)
+                if max_end > len(self._resume_messages):
+                    self._turns = []
+
+            if self._turns:
+                for turn in self._turns:
+                    start = turn.get("msg_start", 0)
+                    end = turn.get("msg_end", 0)
+                    turn_msgs = self._resume_messages[start:end]
+
+                    for msg in turn_msgs:
+                        if isinstance(msg, HumanMessage) and msg.content:
+                            cleaned = strip_system_reminders(msg.content).strip()
+                            if cleaned:
+                                self._add_message(f"> {cleaned}", classes="message-user")
+
+                    has_tools = any(
+                        getattr(m, "tool_calls", None)
+                        for m in turn_msgs
+                        if hasattr(m, "tool_calls")
+                    )
+
+                    if has_tools:
+                        final = _find_final_answer(turn_msgs)
+                        intermediate = []
+                        for msg in turn_msgs:
+                            if isinstance(msg, ToolMessage):
+                                intermediate.append((f"🔧 {msg.name} ✓", True))
+                            elif isinstance(msg, AIMessage) and msg.content and msg is not final:
+                                if not getattr(msg, "tool_calls", None):
+                                    intermediate.append((msg.content, False))
+
+                        duration = turn.get("duration_s", 0)
+                        title = f"思考了 {duration:.0f}s"
+                        if turn.get("interrupted"):
+                            title += " [已中断]"
+
+                        collapsible = Collapsible(
+                            *[Static(text, classes="message-tool" if is_tool else "")
+                              for text, is_tool in intermediate],
+                            title=title,
+                            collapsed=True,
+                        )
+                        chat_view = self.query_one("#chat-view")
+                        chat_view.mount(collapsible)
+                        chat_view.scroll_end(animate=False)
+
+                        if final:
+                            self._add_message(final.content)
+                    else:
+                        final = _find_final_answer(turn_msgs)
+                        if final:
+                            self._add_message(final.content)
+            else:
+                for msg in self._resume_messages:
+                    if isinstance(msg, HumanMessage) and msg.content:
+                        cleaned = strip_system_reminders(msg.content).strip()
+                        if cleaned:
+                            self._add_message(f"> {cleaned}", classes="message-user")
+                    elif isinstance(msg, AIMessage) and msg.content:
+                        self._add_message(msg.content)
+                    elif isinstance(msg, ToolMessage):
+                        self._add_message(f"🔧 {msg.name} ✓", classes="message-tool")
+
             self._add_message("— 继续对话 —", classes="message-queued")
             self._resume_messages = None
         else:
@@ -143,8 +231,6 @@ class FinAgentApp(App):
             self._add_message(HELP_TEXT)
         elif cmd == "clear":
             self._do_clear()
-        elif cmd == "report":
-            self._do_report()
         elif cmd == "reload_skills":
             self._do_reload_skills()
         elif cmd == "skill":
@@ -193,14 +279,14 @@ class FinAgentApp(App):
         # Skill catalog (every turn)
         parts.append(
             f"<system-reminder>\n"
-            f"可用 skills(用 load_skill 工具加载,或用户输入 /<name>):\n"
+            f"可用 skills(用 read_file 工具加载 .finagent/skills/<name>/skill.md,或用户输入 /<name>):\n"
             f"{self._skill_catalog}\n"
             f"</system-reminder>"
         )
 
         return "\n\n".join(parts)
 
-    def _handle_update_msg(self, msg, reply_widget, buffer, tool_widgets, tool_names):
+    def _handle_update_msg(self, msg, reply_widget, buffer, tool_widgets, tool_names, turn_widgets):
         """Process one message from updates stream.
 
         Returns (need_new_reply, last_ai_msg, reply_widget, buffer).
@@ -222,6 +308,7 @@ class FinAgentApp(App):
                 tool_widgets[tc_id] = self._add_message(
                     f"🔧 {name} ⏳", classes="message-tool"
                 )
+                turn_widgets.append(tool_widgets[tc_id])
         elif hasattr(msg, "tool_call_id"):
             w = tool_widgets.pop(msg.tool_call_id, None)
             name = tool_names.pop(msg.tool_call_id, getattr(msg, "name", "tool"))
@@ -243,8 +330,21 @@ class FinAgentApp(App):
         the same widget to ✓ — not a separate line. Subsequent text starts a
         fresh reply widget, so calls render between text segments.
         """
+        turn_start = time.monotonic()
+        turn_widgets: list[Static] = []
+
+        # Capture msg_start before streaming
+        try:
+            pre_state = self.agent.get_state(
+                config={"configurable": {"thread_id": self.thread_id}}
+            )
+            msg_start = len(pre_state.values.get("messages", []))
+        except Exception:
+            msg_start = 0
+
         self._set_status("思考中...")
         reply_widget: Static | None = self._add_message("")
+        turn_widgets.append(reply_widget)
         buffer = ""
         tool_widgets: dict[str, Static] = {}
         tool_names: dict[str, str] = {}
@@ -271,6 +371,7 @@ class FinAgentApp(App):
                     if content and not has_tool_calls:
                         if need_new_reply or reply_widget is None:
                             reply_widget = self._add_message("")
+                            turn_widgets.append(reply_widget)
                             buffer = ""
                             need_new_reply = False
                         buffer += content
@@ -284,7 +385,7 @@ class FinAgentApp(App):
                             continue
                         for msg in state.get("messages", []):
                             nr, lai, reply_widget, buffer = self._handle_update_msg(
-                                msg, reply_widget, buffer, tool_widgets, tool_names
+                                msg, reply_widget, buffer, tool_widgets, tool_names, turn_widgets
                             )
                             need_new_reply = need_new_reply or nr
                             if lai:
@@ -305,6 +406,50 @@ class FinAgentApp(App):
             if self._streaming_worker is not current:
                 # cancelled/superseded: don't clobber a newer worker's state
                 return
+            # Collapse intermediate widgets (best-effort)
+            try:
+                # Yield so pending mounts/removes settle before is_mounted check
+                await asyncio.sleep(0)
+                had_tools = any(
+                    w.has_class("message-tool") for w in turn_widgets if w.is_mounted
+                )
+                if had_tools:
+                    mounted = [w for w in turn_widgets if w.is_mounted]
+                    reply_mounted = [
+                        w for w in mounted if not w.has_class("message-tool")
+                    ]
+                    final_widget = reply_mounted[-1] if reply_mounted else None
+                    final_has_content = (
+                        reply_widget is not None and bool(buffer)
+                    )
+
+                    if final_has_content and final_widget is not None:
+                        intermediate = [w for w in mounted if w is not final_widget]
+                    else:
+                        intermediate = mounted
+
+                    contents = [_static_text(w) for w in intermediate]
+                    for w in intermediate:
+                        await w.remove()
+
+                    duration = time.monotonic() - turn_start
+                    title = f"思考了 {duration:.0f}s"
+                    if current.is_cancelled:
+                        title += " [已中断]"
+
+                    collapsible = Collapsible(
+                        *[Static(c) for c in contents],
+                        title=title,
+                        collapsed=True,
+                    )
+
+                    chat_view = self.query_one("#chat-view")
+                    if final_has_content and final_widget is not None and final_widget.is_mounted:
+                        await chat_view.mount(collapsible, before=final_widget)
+                    else:
+                        await chat_view.mount(collapsible)
+            except Exception:
+                pass  # collapse is best-effort; don't break the finally block
             self._refresh_status_bar()
             self._streaming_worker = None
 
@@ -314,7 +459,15 @@ class FinAgentApp(App):
                     config={"configurable": {"thread_id": self.thread_id}}
                 )
                 msgs = state.values.get("messages", [])
-                write_session(self.thread_id, msgs, self._cumulative_input_tokens)
+                msg_end = len(msgs)
+                self._turns.append({
+                    "type": "turn",
+                    "duration_s": time.monotonic() - turn_start,
+                    "interrupted": current.is_cancelled,
+                    "msg_start": msg_start,
+                    "msg_end": msg_end,
+                })
+                write_session(self.thread_id, msgs, self._cumulative_input_tokens, self._turns)
                 self._run_extraction(msgs)
             except Exception:
                 pass  # persistence is best-effort; don't crash UI
@@ -346,8 +499,7 @@ class FinAgentApp(App):
         self.thread_id = str(uuid.uuid4())
         self._cumulative_input_tokens = 0
         self.agent = create_agent()
-        # /clear 语义为切到新公司分析，丢弃上一 session 的报告路径
-        set_current_report(None)
+        self._turns = []
         self._queue.clear()
         self.query_one("#chat-view").remove_children()
         self._refresh_status_bar()
@@ -361,41 +513,26 @@ class FinAgentApp(App):
         self._skill_catalog = render_catalog(metas)
         self._add_message(f"已加载 {len(metas)} 个 skill")
 
-    def _activate_skill(self, name: str) -> None:
-        """Activate a skill by slash command: inject HumanMessage + ToolMessage.
+    def _activate_skill(self, skill_name: str) -> None:
+        """Inject a read_file tool call targeting the skill's skill.md.
 
-        Produces history equivalent to the agent calling load_skill itself.
+        Agent processes the tool call, reads the file, and skill content enters
+        history naturally — no synthetic ToolMessage needed.
         """
-        try:
-            skill_md = read_skill_md(name)
-        except FileNotFoundError:
-            # Catalog matched but file vanished — treat as ordinary message
-            self._submit_message(f"/{name}")
-            return
-        tool_call_id = f"skill-{uuid.uuid4()}"
-        self.agent.update_state(
-            config={"configurable": {"thread_id": self.thread_id}},
-            values={"messages": [
-                HumanMessage(content=f"/{name}"),
-                AIMessage(
-                    content="",
-                    tool_calls=[{
-                        "name": "load_skill",
-                        "args": {"name": name},
-                        "id": tool_call_id,
-                        "type": "tool_call",
-                    }],
-                ),
-                ToolMessage(content=skill_md, tool_call_id=tool_call_id, name="load_skill"),
-            ]},
+        skill_path = f".finagent/skills/{skill_name}/skill.md"
+        msg = AIMessage(
+            content=f"/{skill_name}",
+            tool_calls=[{
+                "name": "read_file",
+                "args": {"file_path": skill_path},
+                "id": f"activate-{skill_name}",
+            }],
         )
-        # Title from first markdown heading, if present
-        title = name
-        for line in skill_md.splitlines():
-            if line.startswith("#"):
-                title = line.lstrip("#").strip()
-                break
-        self._add_message(f"✓ skill 已加载: {name} — {title}", classes="message-tool")
+        self.agent.update_state(
+            values={"messages": [msg]},
+            config={"configurable": {"thread_id": self.thread_id}},
+        )
+        self._add_message(f"✓ skill 已激活: {skill_name}", classes="message-tool")
 
     @work
     async def _run_extraction(self, messages: list) -> None:
@@ -418,59 +555,6 @@ class FinAgentApp(App):
             self._add_message(f"治理失败: {e}", classes="message-error")
         finally:
             self._refresh_status_bar()
-
-    @work(thread=True)
-    def _do_report(self) -> None:
-        """Generate report from conversation history, show summary inline.
-
-        Runs in a thread worker: generate_report() calls llm.invoke()
-        synchronously (a 10-30s network call). @work(thread=True) keeps
-        the event loop free; all UI mutations route through call_from_thread.
-        """
-        state = self.agent.get_state(
-            config={"configurable": {"thread_id": self.thread_id}}
-        )
-        messages = state.values.get("messages", []) if state and state.values else []
-        if not messages:
-            self.app.call_from_thread(
-                self._add_message,
-                "还没有对话内容，先聊几句再生成报告。",
-                classes="message-error",
-            )
-            return
-        self.app.call_from_thread(self._set_status, "正在生成报告...")
-        try:
-            filepath, content = generate_report(messages)
-            # inject report path into agent checkpoint so subsequent edit
-            # requests ("把风险提示改短") know which file to edit
-            self.agent.update_state(
-                config={"configurable": {"thread_id": self.thread_id}},
-                values={"messages": [HumanMessage(
-                    content=f"(系统通知) 报告已生成，路径: {filepath}。如需编辑报告，请直接告知具体修改。"
-                )]},
-            )
-            # extract title (first markdown heading)
-            title = "未命名报告"
-            for line in content.split("\n"):
-                if line.startswith("#"):
-                    title = line.lstrip("#").strip()
-                    break
-            self.app.call_from_thread(
-                self._add_message,
-                f"报告已生成: {title}\n文件: {filepath}",
-                classes="message-user",
-            )
-        except ValueError as e:
-            self.app.call_from_thread(
-                self._add_message, str(e), classes="message-error"
-            )
-        except Exception as e:
-            self.app.call_from_thread(
-                self._add_message, f"报告生成失败: {e}", classes="message-error"
-            )
-        finally:
-            self.app.call_from_thread(self._set_status, "就绪")
-
 
 def main():
     # Textual replaces file descriptors (stdin/stdout/stderr). Python's default
