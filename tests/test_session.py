@@ -95,7 +95,7 @@ def test_write_and_load_session(tmp_path, monkeypatch):
         ToolMessage(content="数据", tool_call_id="tc1", name="get_financials", id="m3"),
     ]
     write_session("test-session", messages, 500)
-    loaded, tokens = load_session("test-session")
+    loaded, tokens, _turns = load_session("test-session")
     assert len(loaded) == 3
     assert isinstance(loaded[0], HumanMessage)
     assert loaded[0].content == "分析000001"
@@ -109,7 +109,7 @@ def test_write_and_load_session(tmp_path, monkeypatch):
 def test_load_session_missing_file(tmp_path, monkeypatch):
     """Missing session file returns empty list + zero tokens."""
     monkeypatch.setattr("finagent.session.SESSIONS_DIR", tmp_path)
-    messages, tokens = load_session("nonexistent")
+    messages, tokens, _turns = load_session("nonexistent")
     assert messages == []
     assert tokens == 0
 
@@ -124,7 +124,7 @@ def test_load_session_malformed_line_skipped(tmp_path, monkeypatch):
         '{"type": "meta", "cumulative_tokens": 42}\n',
         encoding="utf-8",
     )
-    messages, tokens = load_session("bad")
+    messages, tokens, _turns = load_session("bad")
     assert len(messages) == 1
     assert messages[0].content == "good"
     assert tokens == 42
@@ -145,3 +145,47 @@ def test_count_sessions(tmp_path, monkeypatch):
     (tmp_path / "b.jsonl").write_text("{}", encoding="utf-8")
     (tmp_path / "not_json.txt").write_text("nope", encoding="utf-8")
     assert count_sessions() == 2
+
+
+def test_write_load_session_with_turns(tmp_path, monkeypatch):
+    """write_session with turns data round-trips through load_session."""
+    monkeypatch.setattr("finagent.session.SESSIONS_DIR", tmp_path)
+    messages = [
+        HumanMessage(content="hi", id="m1"),
+        AIMessage(content="hello", id="m2"),
+    ]
+    turns = [
+        {"type": "turn", "duration_s": 5.2, "interrupted": False, "msg_start": 0, "msg_end": 2},
+    ]
+    write_session("turn-session", messages, 100, turns=turns)
+    loaded, tokens, loaded_turns = load_session("turn-session")
+    assert len(loaded) == 2
+    assert tokens == 100
+    assert len(loaded_turns) == 1
+    assert loaded_turns[0]["duration_s"] == 5.2
+    assert loaded_turns[0]["interrupted"] is False
+    assert loaded_turns[0]["msg_start"] == 0
+    assert loaded_turns[0]["msg_end"] == 2
+
+
+def test_load_session_old_format_returns_empty_turns(tmp_path, monkeypatch):
+    """Session file without turn lines returns empty turns list."""
+    monkeypatch.setattr("finagent.session.SESSIONS_DIR", tmp_path)
+    path = tmp_path / "old.jsonl"
+    path.write_text(
+        '{"type": "human", "content": "old"}\n'
+        '{"type": "meta", "cumulative_tokens": 0}\n',
+        encoding="utf-8",
+    )
+    messages, tokens, turns = load_session("old")
+    assert len(messages) == 1
+    assert turns == []
+
+
+def test_load_session_missing_file_returns_empty_turns(tmp_path, monkeypatch):
+    """Missing session file returns empty messages, zero tokens, empty turns."""
+    monkeypatch.setattr("finagent.session.SESSIONS_DIR", tmp_path)
+    messages, tokens, turns = load_session("nonexistent")
+    assert messages == []
+    assert tokens == 0
+    assert turns == []

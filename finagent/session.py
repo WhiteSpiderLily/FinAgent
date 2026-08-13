@@ -72,11 +72,14 @@ def session_path(session_id: str) -> Path:
     return SESSIONS_DIR / f"{session_id}.jsonl"
 
 
-def write_session(session_id: str, messages: list, cumulative_tokens: int) -> None:
-    """Overwrite session file with full message snapshot + meta line."""
+def write_session(session_id: str, messages: list, cumulative_tokens: int, turns: list[dict] | None = None) -> None:
+    """Overwrite session file with full message snapshot + optional turns + meta line."""
     lines = []
     for msg in messages:
         lines.append(json.dumps(serialize_message(msg), ensure_ascii=False))
+    if turns:
+        for turn in turns:
+            lines.append(json.dumps(turn, ensure_ascii=False))
     lines.append(json.dumps(
         {"type": "meta", "cumulative_tokens": cumulative_tokens},
         ensure_ascii=False,
@@ -84,16 +87,17 @@ def write_session(session_id: str, messages: list, cumulative_tokens: int) -> No
     atomic_write(session_path(session_id), "\n".join(lines) + "\n")
 
 
-def load_session(session_id: str) -> tuple[list, int]:
-    """Read JSONL, return (messages, cumulative_tokens).
+def load_session(session_id: str) -> tuple[list, int, list]:
+    """Read JSONL, return (messages, cumulative_tokens, turns).
 
-    Skips malformed lines. Returns ([], 0) if file doesn't exist.
+    Skips malformed lines. Returns ([], 0, []) if file doesn't exist.
     """
     path = session_path(session_id)
     if not path.exists():
-        return [], 0
+        return [], 0, []
     messages = []
     cumulative_tokens = 0
+    turns = []
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
@@ -104,12 +108,14 @@ def load_session(session_id: str) -> tuple[list, int]:
             continue
         if data.get("type") == "meta":
             cumulative_tokens = data.get("cumulative_tokens", 0)
+        elif data.get("type") == "turn":
+            turns.append(data)
         else:
             try:
                 messages.append(deserialize_message(data))
             except (KeyError, ValueError):
                 continue
-    return messages, cumulative_tokens
+    return messages, cumulative_tokens, turns
 
 
 def count_sessions() -> int:
