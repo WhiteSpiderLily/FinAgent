@@ -400,6 +400,215 @@ async def test_user_message_includes_skill_catalog(app):
     assert "demo: 测试 skill" in content
 
 
+@pytest.mark.asyncio
+async def test_alt_enter_inserts_newline(app):
+    """Option+Enter inserts a newline in the input box."""
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "line1"
+        await pilot.press("alt+enter")
+        await pilot.pause()
+        assert "\n" in inp.text
+        assert "line1" in inp.text
+
+
+@pytest.mark.asyncio
+async def test_ctrl_enter_inserts_newline(app):
+    """Ctrl+Enter also inserts a newline (best-effort binding)."""
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "hello"
+        await pilot.press("ctrl+enter")
+        await pilot.pause()
+        assert "\n" in inp.text
+        assert "hello" in inp.text
+
+
+@pytest.mark.asyncio
+async def test_esc_idle_does_nothing(app):
+    """Esc when not streaming is a no-op — input unchanged."""
+    async def fake_astream(*args, **kwargs):
+        yield ("messages", (AIMessageChunk(content="reply"), {}))
+
+    app.agent.astream = fake_astream
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "my draft"
+        await pilot.press("enter")
+        await pilot.app.workers.wait_for_complete()
+        await pilot.pause()
+        inp.text = "editing"
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        assert inp.text == "editing"
+
+
+@pytest.mark.asyncio
+async def test_esc_interrupts_and_backfills(app):
+    """Esc during streaming stops worker and backfills last sent input."""
+    async def slow_astream(*args, **kwargs):
+        yield ("messages", (AIMessageChunk(content="partial"), {}))
+        await asyncio.sleep(10)
+
+    app.agent.astream = slow_astream
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "分析000001"
+        await pilot.press("enter")
+        await pilot.pause(0.01)
+        assert app._streaming_worker is not None
+        await pilot.press("escape")
+        await pilot.app.workers.wait_for_complete()
+        await pilot.pause()
+        assert inp.text == "分析000001"
+
+
+@pytest.mark.asyncio
+async def test_double_esc_clears_input(app):
+    """Two Esc presses within the window clear the input box."""
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "some draft"
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        assert inp.text == ""
+
+
+@pytest.mark.asyncio
+async def test_up_arrow_loads_previous_history(app):
+    """Up arrow at (0,0) loads the previous history entry."""
+    async def fake_astream(*args, **kwargs):
+        yield ("messages", (AIMessageChunk(content="reply"), {}))
+
+    app.agent.astream = fake_astream
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "first"
+        await pilot.press("enter")
+        await pilot.app.workers.wait_for_complete()
+        await pilot.pause()
+        inp.text = "second"
+        await pilot.press("enter")
+        await pilot.app.workers.wait_for_complete()
+        await pilot.pause()
+        assert inp.text == ""
+        await pilot.press("up")
+        await pilot.pause()
+        assert inp.text == "second"
+        await pilot.press("up")
+        await pilot.pause()
+        assert inp.text == "first"
+
+
+@pytest.mark.asyncio
+async def test_down_arrow_loads_next_and_clears(app):
+    """Down arrow at end navigates forward; past newest clears input."""
+    async def fake_astream(*args, **kwargs):
+        yield ("messages", (AIMessageChunk(content="reply"), {}))
+
+    app.agent.astream = fake_astream
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "msg1"
+        await pilot.press("enter")
+        await pilot.app.workers.wait_for_complete()
+        await pilot.pause()
+        inp.text = "msg2"
+        await pilot.press("enter")
+        await pilot.app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("up")   # → msg2
+        await pilot.press("up")   # → msg1
+        await pilot.pause()
+        assert inp.text == "msg1"
+        await pilot.press("down") # → msg2
+        await pilot.pause()
+        assert inp.text == "msg2"
+        await pilot.press("down") # past newest → clear
+        await pilot.pause()
+        assert inp.text == ""
+
+
+@pytest.mark.asyncio
+async def test_up_arrow_moves_cursor_in_multiline(app):
+    """When cursor is not at start, up arrow moves cursor, not history."""
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "line1\nline2"
+        await pilot.press("down")  # cursor to second line
+        await pilot.pause()
+        await pilot.press("up")    # cursor back, not history
+        await pilot.pause()
+        assert inp.text == "line1\nline2"
+
+
+@pytest.mark.asyncio
+async def test_down_arrow_restores_draft(app):
+    """Down arrow past newest restores the draft, not blank."""
+    async def fake_astream(*args, **kwargs):
+        yield ("messages", (AIMessageChunk(content="reply"), {}))
+
+    app.agent.astream = fake_astream
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "submitted msg"
+        await pilot.press("enter")
+        await pilot.app.workers.wait_for_complete()
+        await pilot.pause()
+        inp.text = "my draft"
+        await pilot.pause()
+        await pilot.press("up")
+        await pilot.pause()
+        assert inp.text == "submitted msg"
+        await pilot.press("down")
+        await pilot.pause()
+        assert inp.text == "my draft"
+
+
+@pytest.mark.asyncio
+async def test_edited_history_entry_persists_on_revisit(app):
+    """Edits made while browsing history are cached per-slot."""
+    async def fake_astream(*args, **kwargs):
+        yield ("messages", (AIMessageChunk(content="reply"), {}))
+
+    app.agent.astream = fake_astream
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "original1"
+        await pilot.press("enter")
+        await pilot.app.workers.wait_for_complete()
+        await pilot.pause()
+        inp.text = "original2"
+        await pilot.press("enter")
+        await pilot.app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("up")   # → original2
+        await pilot.pause()
+        assert inp.text == "original2"
+        inp.text = "edited2"
+        await pilot.pause()
+        await pilot.press("up")   # → original1
+        await pilot.pause()
+        assert inp.text == "original1"
+        await pilot.press("down") # back → should see edited2
+        await pilot.pause()
+        assert inp.text == "edited2"
+
+
+@pytest.mark.asyncio
+async def test_input_box_grows_and_caps_at_max(app):
+    """Input box auto-grows with content, capped at max-height 12."""
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "\n".join(f"line{i}" for i in range(20))
+        await pilot.pause()
+        assert inp.region.height <= 12
+
+
 def test_report_command_removed():
     """'/report' is no longer a registered command."""
     from finagent.tui import _COMMANDS

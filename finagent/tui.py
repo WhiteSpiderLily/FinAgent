@@ -4,6 +4,7 @@ import multiprocessing
 import re
 import time
 import uuid
+from pathlib import Path
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -18,6 +19,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, Too
 from finagent.agent import create_agent, create_agent_with_history, reset_checkpoint
 from finagent.config import load_env, MODEL_NAME, CONTEXT_WINDOW_TOKENS
 from finagent.governance import extract_from_turn, run_governance, check_governance_needed
+from finagent.input_history import InputHistory
 from finagent.memory import MemoryLoader
 from finagent.session import write_session, load_session, count_sessions
 from finagent.skills import render_catalog, scan_skills
@@ -32,6 +34,10 @@ HELP_TEXT = """\
 """
 
 _COMMANDS = {"/quit", "/help", "/clear", "/reload_skills"}
+
+INPUT_HISTORY_PATH = Path.home() / ".finagent" / "input_history.json"
+
+_DOUBLE_ESC_WINDOW = 0.3  # seconds
 
 
 def parse_command(text: str, skill_names: frozenset[str] = frozenset()) -> tuple[str, str]:
@@ -81,12 +87,46 @@ class ChatInput(TextArea):
 
     BINDINGS = [
         Binding("enter", "submit", "发送", priority=True),
+        Binding("alt+enter", "newline", "换行", priority=True),
+        Binding("ctrl+enter", "newline", "换行", priority=True),
+        Binding("up", "history_up", "上一条", priority=True),
+        Binding("down", "history_down", "下一条", priority=True),
     ]
 
     class Submitted(Message):
         def __init__(self, value: str) -> None:
             super().__init__()
             self.value = value
+
+    def action_newline(self) -> None:
+        self.insert("\n")
+
+    def action_history_up(self) -> None:
+        app = self.app
+        if not isinstance(app, FinAgentApp):
+            return
+        text = app.history_up(self.cursor_at_start_of_text, self.text)
+        if text is not None:
+            self.text = text
+            self._cursor_to_end()
+        else:
+            self.action_cursor_up()
+
+    def action_history_down(self) -> None:
+        app = self.app
+        if not isinstance(app, FinAgentApp):
+            return
+        text = app.history_down(self.text)
+        if text is not None:
+            self.text = text
+            if text:
+                self._cursor_to_end()
+        elif not self.cursor_at_end_of_text:
+            self.action_cursor_down()
+
+    def _cursor_to_end(self) -> None:
+        lines = self.text.split("\n")
+        self.move_cursor((len(lines) - 1, len(lines[-1])))
 
     def action_submit(self) -> None:
         text = self.text
@@ -99,7 +139,7 @@ class FinAgentApp(App):
     Screen { layout: vertical; }
     #header { height: 1; background: $boost; padding: 0 1; }
     #chat-view { height: 1fr; padding: 0 1; }
-    #input { height: 3; }
+    #input { height: auto; min-height: 3; max-height: 12; }
     #status { height: 1; background: $boost; color: $text-muted; padding: 0 1; }
     .message-user { color: $primary; }
     .message-tool { color: $text-muted; }
@@ -128,6 +168,11 @@ class FinAgentApp(App):
             self._turns = []
         self._queue: list[tuple[str, Static]] = []
         self._streaming_worker = None
+        self._input_history = InputHistory(INPUT_HISTORY_PATH)
+        self._last_esc_time = 0.0
+        self._hist_index = -1
+        self._draft = ""
+        self._edits: dict[int, str] = {}
         # Skill catalog (refreshed by /reload_skills and at startup)
         metas = scan_skills()
         self._skill_catalog_names: frozenset[str] = frozenset(metas.keys())
@@ -224,6 +269,11 @@ class FinAgentApp(App):
         text = event.value.strip()
         if not text:
             return
+        self._input_history.append(text)
+        self._input_history.save()
+        self._hist_index = -1
+        self._edits.clear()
+        self._draft = ""
         cmd, payload = parse_command(text, skill_names=self._skill_catalog_names)
         if cmd == "quit":
             self.exit()
@@ -482,10 +532,56 @@ class FinAgentApp(App):
                 self._streaming_worker = self._start_stream(merged)
 
     def action_interrupt(self) -> None:
-        """Esc handler: cancel current streaming worker."""
-        if self._streaming_worker is not None and self._streaming_worker.is_running:
-            self._streaming_worker.cancel()
-            self._add_message("[已中断]", classes="message-queued")
+        """Esc handler: double-tap clears input, single-tap only acts during streaming."""
+        now = time.monotonic()
+        inp = self.query_one("#input", ChatInput)
+        if now - self._last_esc_time < _DOUBLE_ESC_WINDOW:
+            inp.text = ""
+            self._last_esc_time = 0.0
+            return
+        self._last_esc_time = now
+        if self._streaming_worker is None or not self._streaming_worker.is_running:
+            return
+        self._streaming_worker.cancel()
+        self._add_message("[已中断]", classes="message-queued")
+        text = self.backfill_last()
+        if text is not None:
+            inp.text = text
+            inp._cursor_to_end()
+
+    def history_up(self, at_start: bool, current_text: str = "") -> str | None:
+        """Navigate history backward. Returns text to load, or None for cursor movement."""
+        if self._hist_index < 0:
+            if not at_start:
+                return None
+            self._draft = current_text
+            self._hist_index = len(self._input_history.items)
+        else:
+            self._edits[self._hist_index] = current_text
+        if self._hist_index > 0:
+            self._hist_index -= 1
+        if self._input_history.items:
+            return self._edits.get(self._hist_index, self._input_history.items[self._hist_index])
+        return None
+
+    def history_down(self, current_text: str = "") -> str | None:
+        """Navigate history forward. Returns text, draft on exit, or None if not browsing."""
+        if self._hist_index < 0:
+            return None
+        self._edits[self._hist_index] = current_text
+        items = self._input_history.items
+        if self._hist_index < len(items) - 1:
+            self._hist_index += 1
+            return self._edits.get(self._hist_index, items[self._hist_index])
+        self._hist_index = -1
+        return self._draft
+
+    def backfill_last(self) -> str | None:
+        """Load last sent input into the box and enter browsing mode."""
+        if self._input_history.items:
+            self._hist_index = len(self._input_history.items) - 1
+            return self._input_history.items[-1]
+        return None
 
     def _do_clear(self) -> None:
         """Clear conversation memory and chat view."""
