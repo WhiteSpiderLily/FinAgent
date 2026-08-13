@@ -22,7 +22,12 @@ KNOWN_FILES = ("memory.md", "preference.md", "project.md", "feedback.md", "refer
 
 EXTRACT_PROMPT = """分析以下对话轮次，提取适合长期记忆的内容。
 
+以下是当前已有记忆（仅最近 50 行）：
+{existing_memory}
+
 只提取明确、持久的信息。不确定的不提取。
+与已有记忆语义重复的、无关的，不需要输出。
+没有值得记忆的内容就什么都不做，全部输出空列表。
 分类写入：
 - preference: 用户明确表达的偏好（格式、风格、工作方式）
 - project: 项目规则、约束、技术决策
@@ -35,6 +40,34 @@ EXTRACT_PROMPT = """分析以下对话轮次，提取适合长期记忆的内容
 对话：
 {messages}
 """
+
+
+def validate_and_dedup(items: list, existing: str) -> list[str]:
+    """Filter invalid items + exact dedup against existing content.
+
+    Non-list items returns empty. Non-str items dropped. Empty items dropped.
+    Exact duplicates (after stripping '- ' prefix from existing lines) dropped.
+    Intra-batch duplicates also dropped.
+    """
+    if not isinstance(items, list):
+        return []
+    existing_set = {
+        line.strip().removeprefix("- ").strip()
+        for line in existing.split("\n")
+        if line.strip()
+    }
+    result = []
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        normalized = item.strip()
+        if not normalized:
+            continue
+        if normalized in existing_set:
+            continue
+        result.append(normalized)
+        existing_set.add(normalized)
+    return result
 
 
 def check_governance_needed() -> bool:
@@ -60,13 +93,12 @@ def check_governance_needed() -> bool:
 
 
 async def extract_from_turn(messages: list) -> None:
-    """Per-turn extraction. LLM analyzes the latest turn, appends to detail + memory.md.
+    """Per-turn extraction. LLM analyzes the latest turn, appends to detail files only.
 
-    Uses .replace() for prompt templating (template contains literal JSON braces).
-    Only passes the latest user msg + AI reply (not full tool call chain).
-    Skips turns with <50 chars of text.
+    Injects tail 50 lines of each sub-doc into prompt for context.
+    Uses validate_and_dedup to prevent duplicates and malformed writes.
+    Does NOT write memory.md — that is governance-only.
     """
-    # Extract only the latest user turn + AI reply
     last_user_idx = None
     for i in range(len(messages) - 1, -1, -1):
         if isinstance(messages[i], HumanMessage):
@@ -87,12 +119,21 @@ async def extract_from_turn(messages: list) -> None:
     if len(turn_text) < 50:
         return
 
-    prompt = EXTRACT_PROMPT.replace("{messages}", turn_text)
+    existing_parts = []
+    for category in ("preference", "project", "feedback", "reference"):
+        path = MEMORY_DIR / f"{category}.md"
+        if path.exists():
+            content = path.read_text(encoding="utf-8")
+            tail_lines = content.strip().split("\n")[-50:]
+            existing_parts.append(f"### {category}\n" + "\n".join(tail_lines))
+    existing_memory = "\n\n".join(existing_parts) if existing_parts else "(空)"
+
+    prompt = EXTRACT_PROMPT.replace("{existing_memory}", existing_memory)
+    prompt = prompt.replace("{messages}", turn_text)
     llm = get_llm()
 
     response = await llm.ainvoke(prompt)
     content = response.content
-    # Extract JSON from response (may have markdown fences)
     start = content.find("{")
     end = content.rfind("}") + 1
     if start == -1 or end == 0:
@@ -103,43 +144,99 @@ async def extract_from_turn(messages: list) -> None:
         return
 
     async with _memory_lock:
-        has_content = False
         for category in ("preference", "project", "feedback", "reference"):
             items = findings.get(category, [])
             if not items:
                 continue
-            has_content = True
             detail_path = MEMORY_DIR / f"{category}.md"
             existing = detail_path.read_text(encoding="utf-8") if detail_path.exists() else ""
-            new_section = "\n".join(f"- {item}" for item in items)
+            new_items = validate_and_dedup(items, existing)
+            if not new_items:
+                continue
+            new_section = "\n".join(f"- {item}" for item in new_items)
             atomic_write(detail_path, existing + new_section + "\n")
 
-        if has_content:
-            _append_memory_md(findings)
+
+def _within_cap(content: str) -> bool:
+    """Check if content is within line + byte caps."""
+    if len(content.split("\n")) > MEMORY_MD_MAX_LINES:
+        return False
+    if len(content.encode("utf-8")) > MEMORY_MD_MAX_BYTES:
+        return False
+    return True
 
 
-def _enforce_memory_md_cap(content: str) -> str:
-    """Trim memory.md content to within line + byte caps (keeps most recent)."""
+def _truncate_preserve_header(content: str) -> str:
+    """Truncate to cap, preserving header structure (up to first blank line).
+
+    No blank line found: entire content treated as body.
+    Header alone exceeds cap: hard-cap header.
+    Body: keep tail (most recent entries).
+    """
     lines = content.split("\n")
-    if len(lines) > MEMORY_MD_MAX_LINES:
-        lines = lines[-MEMORY_MD_MAX_LINES:]
-        content = "\n".join(lines)
-    while len(content.encode("utf-8")) > MEMORY_MD_MAX_BYTES and lines:
-        lines.pop(0)
-        content = "\n".join(lines)
-    return content
+
+    header_end = 0
+    for i, line in enumerate(lines):
+        if line.strip() == "" and i > 0:
+            header_end = i + 1
+            break
+
+    header = lines[:header_end]
+    body = lines[header_end:]
+
+    if len(header) > MEMORY_MD_MAX_LINES:
+        return "\n".join(header[:MEMORY_MD_MAX_LINES])
+
+    max_body = MEMORY_MD_MAX_LINES - len(header)
+    if len(body) > max_body:
+        body = body[-max_body:]
+
+    result = "\n".join(header + body)
+    while len(result.encode("utf-8")) > MEMORY_MD_MAX_BYTES and body:
+        body.pop(0)
+        result = "\n".join(header + body)
+    return result
 
 
-def _append_memory_md(findings: dict) -> None:
-    """Append summary lines to memory.md, enforcing size cap."""
-    path = MEMORY_DIR / "memory.md"
-    content = path.read_text(encoding="utf-8") if path.exists() else ""
-    for category in ("preference", "project", "feedback", "reference"):
-        items = findings.get(category, [])
-        for item in items:
-            content += f"- [{category}]({category}.md) — {item}\n"
-    content = _enforce_memory_md_cap(content)
-    atomic_write(path, content)
+COMPRESS_PROMPT = """压缩以下记忆摘要文件，控制在 {max_lines} 行 / {max_bytes} 字节以内。
+
+保留索引结构和重要条目，删除低价值条目。
+格式不变。
+
+内容：
+{content}
+"""
+
+MAX_COMPRESS_RETRIES = 3
+
+
+async def _enforce_memory_md_cap(content: str) -> str:
+    """Enforce memory.md size cap with LLM compress retry then fallback truncate.
+
+    1. Within cap → return as-is.
+    2. Over cap → LLM compress, up to 3 retries (including exceptions).
+    3. All retries fail → _truncate_preserve_header on ORIGINAL content.
+       Falls back to original (not last LLM output) to preserve header structure.
+    """
+    if _within_cap(content):
+        return content
+
+    original = content
+    llm = get_llm()
+    for _ in range(MAX_COMPRESS_RETRIES):
+        try:
+            prompt = COMPRESS_PROMPT.replace("{max_lines}", str(MEMORY_MD_MAX_LINES))
+            prompt = prompt.replace("{max_bytes}", str(MEMORY_MD_MAX_BYTES))
+            prompt = prompt.replace("{content}", content)
+            response = await llm.ainvoke(prompt)
+            compressed = response.content.strip()
+            if _within_cap(compressed):
+                return compressed
+            content = compressed
+        except Exception:
+            continue
+
+    return _truncate_preserve_header(original)
 
 
 GOVERNANCE_PROMPT = """你是记忆维护助手。以下是当前记忆文件内容。
@@ -152,7 +249,7 @@ GOVERNANCE_PROMPT = """你是记忆维护助手。以下是当前记忆文件内
 3. 明确过期的删除
 4. 重新生成 memory.md 摘要 + 索引
 5. memory.md 不超过 200 行 / 25KB。超限时优先压缩低价值条目
-6. detail 文档无大小限制（不注入上下文，按需读取）
+6. detail 文档无大小限制（提取时各注入尾部 50 行，按需读取）
 7. 用 === FILE: <name> === 分隔各文件输出
 
 当前记忆：
@@ -202,15 +299,15 @@ async def run_governance() -> None:
     if not files:
         return
 
+    # Ensure all 5 files exist (missing sections default to empty)
+    for name in KNOWN_FILES:
+        if name not in files:
+            files[name] = ""
+
+    # Enforce memory.md cap BEFORE acquiring lock (async, may call LLM)
+    files["memory.md"] = await _enforce_memory_md_cap(files["memory.md"])
+
     async with _memory_lock:
-        # Ensure all 5 files exist (missing sections default to empty)
-        for name in KNOWN_FILES:
-            if name not in files:
-                files[name] = ""
-
-        # Enforce memory.md cap before staging
-        files["memory.md"] = _enforce_memory_md_cap(files["memory.md"])
-
         # Stage all files in temp subdir, then rename
         MEMORY_DIR.mkdir(parents=True, exist_ok=True)
         staging = MEMORY_DIR / ".staging"
