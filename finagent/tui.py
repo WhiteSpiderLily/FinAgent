@@ -17,6 +17,7 @@ from textual.worker import get_current_worker
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
 from finagent.agent import create_agent, create_agent_with_history, reset_checkpoint
+from finagent.command_freq import CommandFreq
 from finagent.config import load_env, MODEL_NAME, CONTEXT_WINDOW_TOKENS
 from finagent.governance import extract_from_turn, run_governance, check_governance_needed
 from finagent.input_history import InputHistory
@@ -35,7 +36,15 @@ HELP_TEXT = """\
 
 _COMMANDS = {"/quit", "/help", "/clear", "/reload_skills"}
 
+_BUILTIN_DESCRIPTIONS = {
+    "quit": "退出",
+    "help": "显示此帮助",
+    "clear": "清空对话记忆（换公司分析时用）",
+    "reload_skills": "重新扫描 skill 目录，热更新可用列表",
+}
+
 INPUT_HISTORY_PATH = Path.home() / ".finagent" / "input_history.json"
+COMMAND_FREQ_PATH = Path.cwd() / ".finagent.json"
 
 _DOUBLE_ESC_WINDOW = 0.3  # seconds
 
@@ -46,13 +55,21 @@ def parse_command(text: str, skill_names: frozenset[str] = frozenset()) -> tuple
     Returns ("message", text) for non-command input.
     For slash commands, returns (command_name_without_slash, "").
     For /<skill-name> matching an active skill, returns ("skill", skill_name).
+
+    Only matches when input is exactly /name (single token, no args).
+    Any args after the name cause the entire input to fall through to message.
     """
     stripped = text.strip()
-    lower = stripped.lower()
-    if lower in _COMMANDS:
-        return lower[1:], ""
-    if stripped.startswith("/") and stripped[1:] in skill_names:
-        return "skill", stripped[1:]
+    if not stripped.startswith("/"):
+        return "message", stripped
+    tokens = stripped[1:].split()
+    if not tokens or len(tokens) > 1:
+        return "message", stripped
+    cmd = tokens[0].lower()
+    if "/" + cmd in _COMMANDS:
+        return cmd, ""
+    if tokens[0] in skill_names:
+        return "skill", tokens[0]
     return "message", stripped
 
 
@@ -91,6 +108,7 @@ class ChatInput(TextArea):
         Binding("ctrl+enter", "newline", "换行", priority=True),
         Binding("up", "history_up", "上一条", priority=True),
         Binding("down", "history_down", "下一条", priority=True),
+        Binding("tab", "tab_complete", "补全", priority=True),
     ]
 
     class Submitted(Message):
@@ -105,6 +123,9 @@ class ChatInput(TextArea):
         app = self.app
         if not isinstance(app, FinAgentApp):
             return
+        if app._popup_visible:
+            app._popup_move(-1)
+            return
         text = app.history_up(self.cursor_at_start_of_text, self.text)
         if text is not None:
             self.text = text
@@ -116,6 +137,9 @@ class ChatInput(TextArea):
         app = self.app
         if not isinstance(app, FinAgentApp):
             return
+        if app._popup_visible:
+            app._popup_move(1)
+            return
         text = app.history_down(self.text)
         if text is not None:
             self.text = text
@@ -124,14 +148,27 @@ class ChatInput(TextArea):
         elif not self.cursor_at_end_of_text:
             self.action_cursor_down()
 
-    def _cursor_to_end(self) -> None:
-        lines = self.text.split("\n")
-        self.move_cursor((len(lines) - 1, len(lines[-1])))
+    def action_tab_complete(self) -> None:
+        app = self.app
+        if not isinstance(app, FinAgentApp):
+            return
+        if app._popup_visible:
+            app._complete(self, send=False)
+        else:
+            self.insert("\t")
 
     def action_submit(self) -> None:
+        app = self.app
+        if isinstance(app, FinAgentApp) and app._popup_visible:
+            app._complete(self, send=True)
+            return
         text = self.text
         self.text = ""
         self.post_message(self.Submitted(text))
+
+    def _cursor_to_end(self) -> None:
+        lines = self.text.split("\n")
+        self.move_cursor((len(lines) - 1, len(lines[-1])))
 
 
 class FinAgentApp(App):
@@ -140,6 +177,7 @@ class FinAgentApp(App):
     #header { height: 1; background: $boost; padding: 0 1; }
     #chat-view { height: 1fr; padding: 0 1; }
     #input { height: auto; min-height: 3; max-height: 12; }
+    #popup { height: auto; max-height: 8; background: $boost; padding: 0 1; display: none; }
     #status { height: 1; background: $boost; color: $text-muted; padding: 0 1; }
     .message-user { color: $primary; }
     .message-tool { color: $text-muted; }
@@ -169,19 +207,26 @@ class FinAgentApp(App):
         self._queue: list[tuple[str, Static]] = []
         self._streaming_worker = None
         self._input_history = InputHistory(INPUT_HISTORY_PATH)
+        self._command_freq = CommandFreq(COMMAND_FREQ_PATH)
         self._last_esc_time = 0.0
         self._hist_index = -1
         self._draft = ""
         self._edits: dict[int, str] = {}
+        # Slash completion popup state
+        self._popup_visible = False
+        self._popup_items: list[tuple[str, str]] = []
+        self._popup_index = 0
         # Skill catalog (refreshed by /reload_skills and at startup)
-        metas = scan_skills()
-        self._skill_catalog_names: frozenset[str] = frozenset(metas.keys())
-        self._skill_catalog: str = render_catalog(metas)
+        self._skill_catalog_names: frozenset[str] = frozenset()
+        self._skill_catalog: str = ""
+        self._skill_descriptions: dict[str, str] = {}
+        self._apply_skill_catalog(scan_skills())
 
     def compose(self) -> ComposeResult:
         yield Static("FinAgent — A股财报点评助手", id="header")
         yield VerticalScroll(id="chat-view")
         yield ChatInput(id="input")
+        yield Static("", id="popup")
         yield Static("就绪", id="status")
 
     def on_mount(self) -> None:
@@ -287,6 +332,26 @@ class FinAgentApp(App):
             self._activate_skill(payload)
         else:
             self._submit_message(payload)
+        self._record_freq(text)
+
+    def _record_freq(self, text: str) -> None:
+        """Extract command/skill name from input for frequency tracking.
+
+        Decoupled from routing — records even when args are present
+        and the input falls through to the message path.
+        """
+        stripped = text.strip()
+        if not stripped.startswith("/"):
+            return
+        tokens = stripped[1:].split()
+        if not tokens:
+            return
+        first = tokens[0].lower()
+        if "/" + first in _COMMANDS:
+            self._command_freq.increment(first)
+        elif tokens[0] in self._skill_catalog_names:
+            self._command_freq.increment(tokens[0])
+        self._command_freq.save()
 
     def _add_message(self, content, classes: str = "") -> Static:
         """Mount a message widget into the chat view, scroll to bottom."""
@@ -307,6 +372,104 @@ class FinAgentApp(App):
         self.query_one("#status").update(
             f"{MODEL_NAME} | {k_tokens}K/{window_m}M ({pct:.1f}%)"
         )
+
+    # ── Slash completion popup ────────────────────────────────────────────
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        """Refresh popup on every text change in the input box."""
+        self._refresh_popup()
+
+    def _apply_skill_catalog(self, metas: dict) -> None:
+        """Update all skill-derived state from scan_skills() result."""
+        self._skill_catalog_names = frozenset(metas.keys())
+        self._skill_catalog = render_catalog(metas)
+        self._skill_descriptions = {
+            name: meta.description for name, meta in metas.items()
+        }
+
+    def _refresh_popup(self) -> None:
+        """Recompute popup items based on current input text and cursor."""
+        inp = self.query_one("#input", ChatInput)
+        text = inp.text
+        if not text.startswith("/") or not inp.cursor_at_first_line:
+            self._popup_hide()
+            return
+        query = text[1:]
+        if " " in query:
+            self._popup_hide()
+            return
+        items = self._match_items(query)
+        if not items:
+            self._popup_hide()
+            return
+        self._popup_items = items
+        self._popup_index = min(self._popup_index, len(items) - 1)
+        self._popup_show()
+
+    def _match_items(self, query: str) -> list[tuple[str, str]]:
+        """Return (name, description) pairs matching query by substring,
+        ranked by frequency desc, substring position asc, name asc."""
+        candidates: list[tuple[str, str]] = []
+        for name, desc in _BUILTIN_DESCRIPTIONS.items():
+            if query in name:
+                candidates.append((name, desc))
+        for name, desc in self._skill_descriptions.items():
+            if query in name:
+                candidates.append((name, desc))
+        if not candidates:
+            return []
+        candidates.sort(key=lambda item: (
+            -self._command_freq.get(item[0]),
+            item[0].find(query),
+            item[0],
+        ))
+        return candidates
+
+    def _popup_show(self) -> None:
+        self._popup_visible = True
+        popup = self.query_one("#popup")
+        popup.update(self._render_popup())
+        popup.styles.display = "block"
+
+    def _popup_hide(self) -> None:
+        self._popup_visible = False
+        self._popup_items = []
+        self._popup_index = 0
+        self.query_one("#popup").styles.display = "none"
+
+    def _render_popup(self) -> str:
+        lines = []
+        for i, (name, desc) in enumerate(self._popup_items):
+            line = f"/{name} — {desc}"
+            if i == self._popup_index:
+                line = f"[reverse]{line}[/]"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _popup_move(self, delta: int) -> None:
+        if not self._popup_items:
+            return
+        n = len(self._popup_items)
+        self._popup_index = (self._popup_index + delta) % n
+        self.query_one("#popup").update(self._render_popup())
+
+    def _complete(self, inp: ChatInput, send: bool) -> None:
+        """Replace /token in input with selected item, optionally send."""
+        if not self._popup_items:
+            return
+        name, _desc = self._popup_items[self._popup_index]
+        text = inp.text
+        end_col = next(
+            (i for i, ch in enumerate(text) if ch.isspace()), len(text)
+        )
+        replacement = "/" + name + (" " if not send else "")
+        inp.replace(replacement, (0, 0), (0, end_col))
+        inp.move_cursor((0, len(replacement)))
+        self._popup_hide()
+        if send:
+            submitted_text = inp.text
+            inp.text = ""
+            inp.post_message(ChatInput.Submitted(submitted_text))
 
     def _submit_message(self, text: str) -> None:
         """Send a message to the agent, or enqueue if agent is busy."""
@@ -605,8 +768,7 @@ class FinAgentApp(App):
     def _do_reload_skills(self) -> None:
         """Rescan skill directories, refresh in-memory catalog."""
         metas = scan_skills()
-        self._skill_catalog_names = frozenset(metas.keys())
-        self._skill_catalog = render_catalog(metas)
+        self._apply_skill_catalog(metas)
         self._add_message(f"已加载 {len(metas)} 个 skill")
 
     def _activate_skill(self, skill_name: str) -> None:

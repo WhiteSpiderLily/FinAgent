@@ -54,29 +54,45 @@ def _normalize_period(period: str) -> str:
     raise ValueError(f"无法识别报告期格式: {period}")
 
 
+def _clean(val, default: str) -> str:
+    """Return str(val) or default if val is None, NaN, or empty."""
+    s = str(val) if val is not None else ""
+    return s if s and s != "nan" else default
+
+
 def company_info(stock_code: str) -> dict:
     code = norm_ticker(stock_code)
-    prefix = get_prefix(code).upper()
-    symbol = f"{prefix}{code}"
-    df = ak.stock_individual_basic_info_xq(symbol=symbol)
-    rows = dict(zip(df["item"], df["value"]))
-    name = rows.get("org_short_name_cn", "未知")
-    industry_raw = rows.get("affiliate_industry", "")
-    industry = (
-        industry_raw.get("ind_name", "未知")
-        if isinstance(industry_raw, dict)
-        else str(industry_raw) or "未知"
-    )
-    listed_ms = rows.get("listed_date")
-    listing = "N/A"
-    if listed_ms:
-        from datetime import datetime
-        listing = datetime.fromtimestamp(int(listed_ms) / 1000).strftime("%Y-%m-%d")
-    main_biz = str(rows.get("main_operation_business", ""))[:80]
+    df = ak.stock_profile_cninfo(symbol=code)
+    if df.empty:
+        return {"code": code, "name": "未知", "industry": "未知", "listing": "N/A", "main_biz": ""}
+    row = df.iloc[0].to_dict()
     return {
-        "code": code, "name": name, "industry": industry,
-        "listing": listing, "main_biz": main_biz,
+        "code": code,
+        "name": _clean(row.get("A股简称"), "未知"),
+        "industry": _clean(row.get("所属行业"), "未知"),
+        "listing": _clean(row.get("上市日期"), "N/A")[:10],
+        "main_biz": _clean(row.get("主营业务"), "")[:80],
     }
+
+
+def industry_ranking_ths(top_n: int = 20) -> dict:
+    df = ak.stock_board_industry_summary_ths()
+    if df.empty:
+        return {"top": [], "bottom": [], "total": 0}
+    df = df.sort_values("涨跌幅", ascending=False).reset_index(drop=True)
+    rows = []
+    for i, r in df.iterrows():
+        rows.append({
+            "rank": i + 1,
+            "name": r.get("板块", ""),
+            "change_pct": r.get("涨跌幅", 0),
+            "code": "",
+            "up_count": r.get("上涨家数", 0),
+            "down_count": r.get("下跌家数", 0),
+            "leader": r.get("领涨股", ""),
+            "leader_change": r.get("领涨股-涨跌幅", 0),
+        })
+    return {"top": rows[:top_n], "bottom": rows[-top_n:], "total": len(rows)}
 
 
 def _find_row(df, date_str):

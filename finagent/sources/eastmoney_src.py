@@ -1,5 +1,13 @@
+import json
+import logging
+
+import requests
+
 from finagent.sources._emclient import em_get, UA, REPORT_API, eastmoney_datacenter
 from finagent.sources._ticker import norm_ticker, get_prefix
+from finagent.sources.registry import DataSourceError
+
+log = logging.getLogger(__name__)
 
 
 def industry_ranking(top_n: int = 20) -> dict:
@@ -87,6 +95,21 @@ def dividend_history(stock_code: str, page_size: int = 20) -> list[dict]:
     } for row in data]
 
 
+def _fund_flow_sina(stock_code: str) -> list[dict]:
+    """新浪个股资金流（push2his 降级源）。返回升序（oldest-first）。"""
+    pre = get_prefix(stock_code) + stock_code
+    url = (f"https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+           f"MoneyFlow.ssl_qsfx_zjlrqs?page=1&num=60&sort=opendate&asc=0&daima={pre}")
+    r = requests.get(url, headers={"User-Agent": UA, "Referer": "https://finance.sina.com.cn/"}, timeout=15)
+    t = r.text
+    try:
+        arr = json.loads(t[t.index("["):t.rindex("]") + 1])
+    except (json.JSONDecodeError, ValueError):
+        raise DataSourceError("Sina 资金流响应解析失败（可能被限流）")
+    arr.reverse()
+    return arr
+
+
 def fund_flow(stock_code: str) -> list[dict]:
     code = norm_ticker(stock_code)
     market_code = 1 if get_prefix(code) == "sh" else 0
@@ -97,20 +120,33 @@ def fund_flow(stock_code: str) -> list[dict]:
         "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
         "lmt": "120",
     }
-    r = em_get(url, params=params,
-               headers={"User-Agent": UA, "Referer": "https://quote.eastmoney.com/",
-                        "Origin": "https://quote.eastmoney.com"}, timeout=15)
-    klines = r.json().get("data", {}).get("klines", [])
-    rows = []
-    for line in klines:
-        parts = line.split(",")
-        if len(parts) >= 6:
-            rows.append({
-                "date": parts[0],
-                "main_net": float(parts[1]) if parts[1] != "-" else 0,
-                "small_net": float(parts[2]) if parts[2] != "-" else 0,
-                "mid_net": float(parts[3]) if parts[3] != "-" else 0,
-                "large_net": float(parts[4]) if parts[4] != "-" else 0,
-                "super_net": float(parts[5]) if parts[5] != "-" else 0,
-            })
-    return rows
+    try:
+        r = em_get(url, params=params,
+                   headers={"User-Agent": UA, "Referer": "https://quote.eastmoney.com/",
+                            "Origin": "https://quote.eastmoney.com"}, timeout=15)
+        klines = r.json().get("data", {}).get("klines", [])
+        rows = []
+        for line in klines:
+            parts = line.split(",")
+            if len(parts) >= 6:
+                rows.append({
+                    "date": parts[0],
+                    "main_net": float(parts[1]) if parts[1] != "-" else 0,
+                    "small_net": float(parts[2]) if parts[2] != "-" else 0,
+                    "mid_net": float(parts[3]) if parts[3] != "-" else 0,
+                    "large_net": float(parts[4]) if parts[4] != "-" else 0,
+                    "super_net": float(parts[5]) if parts[5] != "-" else 0,
+                })
+        return rows
+    except (requests.RequestException, json.JSONDecodeError, OSError) as e:
+        log.warning("eastmoney fund_flow failed, falling back to Sina: %s", e)
+        raw = _fund_flow_sina(code)
+        return [{
+            "date": x.get("opendate", ""),
+            "main_net": float(x.get("netamount") or 0),
+            "small_net": None,
+            "mid_net": None,
+            "large_net": None,
+            "super_net": None,
+            "source": "sina",
+        } for x in raw]

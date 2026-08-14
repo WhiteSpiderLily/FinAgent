@@ -13,7 +13,7 @@ EM_SESSION = requests.Session()
 EM_SESSION.headers.update({"User-Agent": UA})
 try:
     _retry = Retry(
-        total=3, connect=3, backoff_factor=0.6,
+        total=4, connect=3, read=2, backoff_factor=0.6,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
     )

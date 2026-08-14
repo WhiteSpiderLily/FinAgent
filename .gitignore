@@ -17,6 +17,7 @@ reports/
 
 # FinAgent runtime data (sessions, memory)
 .finagent/
+.finagent.json
 .superpowers/
 
 # AI tooling (local-only)
