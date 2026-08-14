@@ -1099,3 +1099,376 @@ async def test_restore_strips_reminders():
             assert any("分析002415" in t for t in texts)
             assert not any("秘密" in t for t in texts)
             assert not any("<system-reminder>" in t for t in texts)
+
+
+# ── Slash completion popup tests ──────────────────────────────────────────
+
+def _popup_visible(app) -> bool:
+    """Check if popup widget is displayed."""
+    return app.query_one("#popup").styles.display != "none"
+
+
+def _popup_text(app) -> str:
+    return str(app.query_one("#popup").content)
+
+
+@pytest.mark.asyncio
+async def test_popup_hidden_initially(app):
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert not _popup_visible(app)
+
+
+@pytest.mark.asyncio
+async def test_popup_visible_on_slash(app):
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/"
+        await pilot.pause()
+        assert _popup_visible(app)
+
+
+@pytest.mark.asyncio
+async def test_popup_hidden_on_non_slash(app):
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "hello"
+        await pilot.pause()
+        assert not _popup_visible(app)
+
+
+@pytest.mark.asyncio
+async def test_popup_hidden_on_mid_text_slash(app):
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "a/b"
+        await pilot.pause()
+        assert not _popup_visible(app)
+
+
+@pytest.mark.asyncio
+async def test_popup_hidden_on_multiline_second_row(app):
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/\nsecond"
+        inp.move_cursor((1, 0))
+        await pilot.pause()
+        assert not _popup_visible(app)
+
+
+@pytest.mark.asyncio
+async def test_popup_filters_by_substring(app):
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/he"
+        await pilot.pause()
+        assert _popup_visible(app)
+        text = _popup_text(app)
+        assert "/help" in text
+        assert "/quit" not in text
+
+
+@pytest.mark.asyncio
+async def test_popup_hidden_on_zero_match(app):
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/zzz"
+        await pilot.pause()
+        assert not _popup_visible(app)
+
+
+@pytest.mark.asyncio
+async def test_popup_includes_descriptions(app):
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/"
+        await pilot.pause()
+        text = _popup_text(app)
+        assert "—" in text  # name — description format
+
+
+@pytest.mark.asyncio
+async def test_popup_single_match_visible(app):
+    """Single match: popup stays visible with one item."""
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        # /help is the only builtin containing "elp"
+        inp.text = "/elp"
+        await pilot.pause()
+        assert _popup_visible(app)
+        text = _popup_text(app)
+        assert "/help" in text
+
+
+# ── Ranking ───────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_popup_ranking_by_frequency(app):
+    async with app.run_test() as pilot:
+        app._command_freq._freq = {"quit": 10, "help": 0}
+        inp = app.query_one("#input", ChatInput)
+        # Both contain empty substring when query is ""
+        inp.text = "/"
+        await pilot.pause()
+        text = _popup_text(app)
+        lines = text.split("\n")
+        # /quit (freq 10) should come before /help (freq 0)
+        quit_idx = next(i for i, l in enumerate(lines) if "/quit" in l)
+        help_idx = next(i for i, l in enumerate(lines) if "/help" in l)
+        assert quit_idx < help_idx
+
+
+@pytest.mark.asyncio
+async def test_popup_ranking_tiebreak_by_position(app):
+    async with app.run_test() as pilot:
+        # /help contains "h" at position 0 (after stripping /)
+        # /reload_skills does NOT contain "h"... use a skill that does
+        app._command_freq._freq = {}  # all zero
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/h"
+        await pilot.pause()
+        text = _popup_text(app)
+        lines = text.split("\n")
+        # /help (position 0) should appear
+        assert any("/help" in l for l in lines)
+
+
+# ── Tab completion ────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_tab_completes_and_adds_space(app):
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/he"
+        await pilot.pause()
+        assert _popup_visible(app)
+        await pilot.press("tab")
+        await pilot.pause()
+        assert inp.text == "/help "
+        assert not _popup_visible(app)
+
+
+@pytest.mark.asyncio
+async def test_tab_when_popup_hidden_indents(app):
+    """Tab with no popup falls back to TextArea default indent."""
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "hello"
+        await pilot.pause()
+        await pilot.press("tab")
+        await pilot.pause()
+        assert "\t" in inp.text
+        assert not _popup_visible(app)
+
+
+# ── Enter completion + send ───────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_enter_when_popup_visible_sends_completed(app):
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/he"
+        await pilot.pause()
+        assert _popup_visible(app)
+        await pilot.press("enter")
+        await pilot.pause()
+        # /help was executed — help text should appear
+        assert not _popup_visible(app)
+        assert inp.text == ""
+        chat = app.query_one("#chat-view")
+        messages = [str(c.content) for c in chat.children if isinstance(c, Static)]
+        assert any("可用命令" in m for m in messages)
+
+
+# ── Up/Down navigation ────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_down_arrow_moves_popup_selection(app):
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/"
+        await pilot.pause()
+        assert app._popup_index == 0
+        await pilot.press("down")
+        await pilot.pause()
+        assert app._popup_index == 1
+
+
+@pytest.mark.asyncio
+async def test_up_arrow_moves_popup_selection(app):
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/"
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.pause()
+        assert app._popup_index == 1
+        await pilot.press("up")
+        await pilot.pause()
+        assert app._popup_index == 0
+
+
+@pytest.mark.asyncio
+async def test_popup_down_does_not_trigger_history(app):
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/"
+        await pilot.pause()
+        before_text = inp.text
+        await pilot.press("down")
+        await pilot.pause()
+        # text unchanged — down navigated popup, not history
+        assert inp.text == before_text
+
+
+# ── Dismissal ─────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_space_dismisses_popup(app):
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/he"
+        await pilot.pause()
+        assert _popup_visible(app)
+        # type space
+        inp.text = "/he "
+        await pilot.pause()
+        assert not _popup_visible(app)
+
+
+@pytest.mark.asyncio
+async def test_deleting_slash_dismisses_popup(app):
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/"
+        await pilot.pause()
+        assert _popup_visible(app)
+        inp.text = "hello"
+        await pilot.pause()
+        assert not _popup_visible(app)
+
+
+# ── Frequency recording ───────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_clear_command_increments_freq(app):
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/clear"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app._command_freq.get("clear") == 1
+
+
+@pytest.mark.asyncio
+async def test_skill_command_increments_freq(app):
+    async with app.run_test() as pilot:
+        app._skill_catalog_names = frozenset({"demo"})
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/demo"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app._command_freq.get("demo") == 1
+
+
+@pytest.mark.asyncio
+async def test_skill_with_args_still_records_freq(app):
+    """/skill-name + args falls to message path, but freq still recorded (decoupled)."""
+    async with app.run_test() as pilot:
+        app._skill_catalog_names = frozenset({"earnings-review"})
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/earnings-review\n000001 2025q1"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app._command_freq.get("earnings-review") == 1
+
+
+# ── parse_command edge cases ──────────────────────────────────────────────
+
+def test_parse_command_trailing_space_builtin():
+    assert parse_command("/help ", skill_names=frozenset()) == ("help", "")
+
+
+def test_parse_command_trailing_space_skill():
+    sn = frozenset({"earnings-review"})
+    assert parse_command("/earnings-review ", skill_names=sn) == ("skill", "earnings-review")
+
+
+def test_parse_command_inline_args_is_message():
+    """Skill name with inline args falls through to message path."""
+    sn = frozenset({"earnings-review"})
+    assert parse_command("/earnings-review 000001", skill_names=sn) == ("message", "/earnings-review 000001")
+
+
+def test_parse_command_newline_args_is_message():
+    """Skill name with newline-separated args falls through to message path."""
+    sn = frozenset({"earnings-review"})
+    result = parse_command("/earnings-review\n000001", skill_names=sn)
+    assert result == ("message", "/earnings-review\n000001")
+
+
+def test_parse_command_tab_args_is_message():
+    """Skill name with tab-separated args falls through to message path."""
+    sn = frozenset({"earnings-review"})
+    assert parse_command("/earnings-review\t000001", skill_names=sn) == ("message", "/earnings-review\t000001")
+
+
+def test_parse_command_skill_with_args_is_message():
+    """Skill name followed by args must fall through to message path."""
+    sn = frozenset({"earnings-review"})
+    assert parse_command("/earnings-review 000001 2025q3", skill_names=sn) == ("message", "/earnings-review 000001 2025q3")
+
+
+def test_parse_command_skill_alone_no_args_matches():
+    """Skill name alone (no args) still matches as skill."""
+    sn = frozenset({"earnings-review"})
+    assert parse_command("/earnings-review", skill_names=sn) == ("skill", "earnings-review")
+
+
+def test_parse_command_leading_trailing_whitespace():
+    assert parse_command("  /help  ") == ("help", "")
+
+
+def test_parse_command_slash_alone_is_message():
+    assert parse_command("/") == ("message", "/")
+
+
+def test_parse_command_slash_space_is_message():
+    assert parse_command("/   ") == ("message", "/")
+
+
+def test_parse_command_empty_is_message():
+    assert parse_command("") == ("message", "")
+
+
+def test_parse_command_builtin_with_args_is_message():
+    """Builtin with extra args falls through to message path."""
+    assert parse_command("/HELP extra") == ("message", "/HELP extra")
+
+
+def test_parse_command_skill_case_sensitive():
+    sn = frozenset({"earnings-review"})
+    assert parse_command("/Earnings-Review", skill_names=sn) == ("message", "/Earnings-Review")
+
+
+@pytest.mark.asyncio
+async def test_message_does_not_increment_freq(app):
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "002415 2024Q3"
+        await pilot.press("enter")
+        await pilot.pause()
+        # No builtin or skill triggered
+        assert all(v == 0 for v in app._command_freq._freq.values())
+
+
+@pytest.mark.asyncio
+async def test_tab_only_does_not_increment_freq(app):
+    """Tab completion alone (no send) must not record frequency."""
+    async with app.run_test() as pilot:
+        inp = app.query_one("#input", ChatInput)
+        inp.text = "/he"
+        await pilot.pause()
+        await pilot.press("tab")
+        await pilot.pause()
+        assert app._command_freq.get("help") == 0

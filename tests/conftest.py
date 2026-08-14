@@ -17,6 +17,7 @@ def _mock_tui_persistence(tmp_path, monkeypatch):
     Patches at the tui.py import level so direct module tests are unaffected.
     """
     monkeypatch.setattr("finagent.tui.INPUT_HISTORY_PATH", tmp_path / "ih.json")
+    monkeypatch.setattr("finagent.tui.COMMAND_FREQ_PATH", tmp_path / "freq.json")
     with patch("finagent.tui.write_session"), \
          patch("finagent.tui.extract_from_turn", new_callable=AsyncMock), \
          patch("finagent.tui.run_governance", new_callable=AsyncMock), \

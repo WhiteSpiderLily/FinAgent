@@ -257,14 +257,21 @@ def get_fund_flow(stock_code: str) -> str:
     if not rows:
         return "暂无资金流数据。"
     recent = rows[-20:]
+    degraded = any(r.get("source") for r in recent)
     total_main = sum(r["main_net"] for r in recent)
-    total_super = sum(r["super_net"] for r in recent)
     lines = [f"近 {len(rows)} 日资金流（近 20 日汇总）:"]
     lines.append(f"  主力净流入: {total_main / 1e8:+.2f}亿")
-    lines.append(f"  超大单净额: {total_super / 1e8:+.2f}亿")
+    if degraded:
+        lines.append("  ⚠️ 数据已降级（仅含主力净额，无四档分解）")
+    else:
+        total_super = sum(r["super_net"] for r in recent)
+        lines.append(f"  超大单净额: {total_super / 1e8:+.2f}亿")
     lines.append("近 5 日:")
     for r in rows[-5:]:
-        lines.append(f"  {r['date']}  主力 {r['main_net'] / 1e4:+.0f}万  超大 {r['super_net'] / 1e4:+.0f}万")
+        line = f"  {r['date']}  主力 {r['main_net'] / 1e4:+.0f}万"
+        if not degraded:
+            line += f"  超大 {r['super_net'] / 1e4:+.0f}万"
+        lines.append(line)
     return "\n".join(lines)
 
 

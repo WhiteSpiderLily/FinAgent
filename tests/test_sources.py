@@ -1,10 +1,14 @@
+import json
+
 import pytest
+import requests
 from unittest.mock import patch, MagicMock
 import pandas as pd
 import numpy as np
 
 from finagent.sources import akshare_src
 from finagent.sources import tencent_src
+from finagent.sources.registry import DataSourceError
 
 
 def _make_tencent_raw():
@@ -63,25 +67,66 @@ def test_valuation_stale_flag(monkeypatch):
     assert result["stale_reason"]
 
 
-def _fake_company_df():
-    return pd.DataFrame({
-        "item": ["org_short_name_cn", "affiliate_industry", "total_shares", "float_shares", "listed_date"],
-        "value": ["海康威视", {"ind_name": "计算机设备"}, "91.6亿", "90.5亿", "20100528"],
-    })
+def _fake_cninfo_df():
+    return pd.DataFrame([{
+        "公司名称": "平安银行股份有限公司",
+        "A股代码": "000001",
+        "A股简称": "平安银行",
+        "所属行业": "货币金融服务",
+        "上市日期": "1991-04-03",
+        "主营业务": "吸收公众存款；发放短期、中期和长期贷款",
+        "经营范围": "办理人民币存贷款",
+        "机构简介": "平安银行股份有限公司",
+    }])
 
 
 def test_company_info_success():
-    with patch("finagent.sources.akshare_src.ak.stock_individual_basic_info_xq",
-               return_value=_fake_company_df()):
-        result = akshare_src.company_info("002415")
-    assert result["name"] == "海康威视"
-    assert result["code"] == "002415"
-    assert "计算机" in result["industry"]
+    with patch("finagent.sources.akshare_src.ak.stock_profile_cninfo",
+               return_value=_fake_cninfo_df()):
+        result = akshare_src.company_info("000001")
+    assert result["name"] == "平安银行"
+    assert result["code"] == "000001"
+    assert result["industry"] == "货币金融服务"
+    assert result["listing"] == "1991-04-03"
 
 
 def test_company_info_bad_code():
     with pytest.raises(ValueError):
         akshare_src.company_info("123")
+
+
+def test_company_info_main_biz():
+    with patch("finagent.sources.akshare_src.ak.stock_profile_cninfo",
+               return_value=_fake_cninfo_df()):
+        result = akshare_src.company_info("000001")
+    assert "吸收公众存款" in result["main_biz"]
+
+
+def test_company_info_empty_dataframe_returns_defaults(monkeypatch):
+    """Empty DataFrame from cninfo returns default dict without crash."""
+    monkeypatch.setattr(akshare_src.ak, "stock_profile_cninfo",
+                        lambda symbol: pd.DataFrame())
+    result = akshare_src.company_info("999999")
+    assert result["code"] == "999999"
+    assert result["name"] == "未知"
+    assert result["industry"] == "未知"
+    assert result["listing"] == "N/A"
+
+
+def test_company_info_nan_field_returns_default(monkeypatch):
+    """NaN values in DataFrame fields return defaults, not 'nan'."""
+    df = pd.DataFrame([{
+        "A股简称": "测试",
+        "所属行业": np.nan,
+        "上市日期": np.nan,
+        "主营业务": "主营业务文本",
+    }])
+    monkeypatch.setattr(akshare_src.ak, "stock_profile_cninfo", lambda symbol: df)
+    result = akshare_src.company_info("002415")
+    assert result["industry"] == "未知"
+    assert result["listing"] == "N/A"
+    assert result["name"] == "测试"
+    assert "主营业务文本" in result["main_biz"]
 
 
 def _fake_profit_df():
@@ -184,6 +229,37 @@ def test_industry_ranking_empty(monkeypatch):
     assert result["total"] == 0
 
 
+def _fake_ths_industry_df():
+    return pd.DataFrame([
+        {"板块": "电力设备", "涨跌幅": 3.5, "上涨家数": 200, "下跌家数": 50,
+         "领涨股": "宁德时代", "领涨股-涨跌幅": 5.0},
+        {"板块": "白酒", "涨跌幅": -1.2, "上涨家数": 10, "下跌家数": 90,
+         "领涨股": "贵州茅台", "领涨股-涨跌幅": 0.5},
+    ])
+
+
+def test_industry_ranking_ths_success():
+    with patch("finagent.sources.akshare_src.ak.stock_board_industry_summary_ths",
+               return_value=_fake_ths_industry_df()):
+        result = akshare_src.industry_ranking_ths(top_n=5)
+    assert result["total"] == 2
+    assert result["top"][0]["name"] == "电力设备"
+    assert result["top"][0]["change_pct"] == 3.5
+    assert result["top"][0]["leader"] == "宁德时代"
+    assert result["bottom"][-1]["name"] == "白酒"
+
+
+def test_industry_ranking_ths_fallback_in_fetch():
+    from finagent.sources.registry import fetch
+    fn_ths = MagicMock(side_effect=RuntimeError("同花顺 401"))
+    fn_em = MagicMock(return_value={"top": [], "bottom": [], "total": 0})
+    reg = {"industry_ranking": [fn_ths, fn_em]}
+    result = fetch("industry_ranking", registry=reg, top_n=5)
+    assert result["total"] == 0
+    fn_ths.assert_called_once_with(top_n=5)
+    fn_em.assert_called_once_with(top_n=5)
+
+
 def test_research_reports_success(monkeypatch):
     fake_resp = MagicMock()
     fake_resp.json.return_value = {"data": [{"title": "买入", "orgSName": "中信"}], "TotalPage": 1}
@@ -247,6 +323,74 @@ def test_fund_flow_empty(monkeypatch):
     assert eastmoney_src.fund_flow("002415") == []
 
 
+def test_fund_flow_sina_degradation(monkeypatch):
+    """push2his 失败时降级到新浪，返回主力净额，四档 None，带 source 标注。"""
+    def em_fail(*a, **kw):
+        raise requests.ConnectionError("push2his RemoteDisconnected")
+    # Sina returns descending (newest first); fund_flow passes through as-is
+    fake_sina = [{"opendate": "2024-10-21", "trade": "10.8", "netamount": "50000000.0"},
+                 {"opendate": "2024-10-20", "trade": "10.5", "netamount": "-78984704.36"}]
+    monkeypatch.setattr(eastmoney_src, "em_get", em_fail)
+    monkeypatch.setattr(eastmoney_src, "_fund_flow_sina", lambda code: fake_sina)
+    result = eastmoney_src.fund_flow("002415")
+    assert len(result) == 2
+    assert result[0]["date"] == "2024-10-21"
+    assert result[0]["main_net"] == 50000000.0
+    assert result[0]["super_net"] is None
+    assert result[0]["large_net"] is None
+    assert result[0]["source"] == "sina"
+
+
+def test_fund_flow_sina_function(monkeypatch):
+    """_fund_flow_sina 从新浪 API 拉取并解析资金流，返回升序。"""
+    raw = json.dumps([
+        {"opendate": "2024-10-21", "trade": "10.8", "netamount": "2000000"},
+        {"opendate": "2024-10-20", "trade": "10.5", "netamount": "-1000000"},
+    ])
+    fake_resp = MagicMock()
+    fake_resp.text = raw
+    monkeypatch.setattr(eastmoney_src.requests, "get", lambda *a, **kw: fake_resp)
+    result = eastmoney_src._fund_flow_sina("002415")
+    assert len(result) == 2
+    assert result[0]["opendate"] == "2024-10-20"
+    assert result[0]["netamount"] == "-1000000"
+
+
+def test_fund_flow_sina_reverses_to_ascending(monkeypatch):
+    """_fund_flow_sina returns ascending order even when Sina API sends descending."""
+    raw = json.dumps([
+        {"opendate": "2024-10-22", "netamount": "3000000"},
+        {"opendate": "2024-10-21", "netamount": "2000000"},
+        {"opendate": "2024-10-20", "netamount": "1000000"},
+    ])
+    fake_resp = MagicMock()
+    fake_resp.text = raw
+    monkeypatch.setattr(eastmoney_src.requests, "get", lambda *a, **kw: fake_resp)
+    result = eastmoney_src._fund_flow_sina("002415")
+    assert result[0]["opendate"] == "2024-10-20"
+    assert result[2]["opendate"] == "2024-10-22"
+
+
+def test_fund_flow_eastmoney_parse_error_not_swallowed(monkeypatch):
+    """Malformed kline data raises ValueError, not silent Sina fallback."""
+    class FakeResponse:
+        def json(self):
+            return {"data": {"klines": ["2024-10-20,abc,def,ghi,jkl,mno"]}}
+    monkeypatch.setattr(eastmoney_src, "em_get", lambda *a, **kw: FakeResponse())
+    monkeypatch.setattr(eastmoney_src, "_fund_flow_sina", lambda code: [])
+    with pytest.raises(ValueError):
+        eastmoney_src.fund_flow("002415")
+
+
+def test_fund_flow_sina_non_json_raises_clear_error(monkeypatch):
+    """Sina returning HTML/limit-message raises DataSourceError, not ValueError."""
+    fake_resp = MagicMock()
+    fake_resp.text = "<html>rate limited</html>"
+    monkeypatch.setattr(eastmoney_src.requests, "get", lambda *a, **kw: fake_resp)
+    with pytest.raises(DataSourceError, match="资金流"):
+        eastmoney_src._fund_flow_sina("002415")
+
+
 from finagent.sources import sina_src
 
 
@@ -294,3 +438,17 @@ def test_holder_change_null_fields(monkeypatch):
     assert result[0]["holder_num"] == 0
     assert result[0]["change_ratio"] == 0
     assert result[0]["avg_shares"] == 0
+
+
+def test_fund_flow_tool_handles_degraded_data(monkeypatch):
+    """get_fund_flow 工具必须处理新浪降级返回的 None 字段（super_net 等）。"""
+    from finagent.tools import get_fund_flow
+    degraded = [
+        {"date": "2024-10-20", "main_net": -78984704.36, "small_net": None,
+         "mid_net": None, "large_net": None, "super_net": None, "source": "sina"},
+        {"date": "2024-10-21", "main_net": 50000000.0, "small_net": None,
+         "mid_net": None, "large_net": None, "super_net": None, "source": "sina"},
+    ]
+    monkeypatch.setattr("finagent.tools.fetch", lambda *a, **kw: degraded)
+    result = get_fund_flow.invoke({"stock_code": "002415"})
+    assert "主力净流入" in result
